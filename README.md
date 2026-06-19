@@ -4,8 +4,8 @@ A [Homebridge](https://homebridge.io) plugin for RainPoint irrigation systems. C
 
 RainPoint devices are managed through one of two companion apps, each backed by a different cloud:
 
-- **RainPoint Home** — the original app, using the RainPoint Home cloud.
-- **RainPoint TY** — the newer app (Tuya-based), using the Tuya IoT cloud.
+- **RainPoint TY** — the original app (Tuya-based), using the Tuya IoT cloud.
+- **RainPoint Home** — the newer, self-developed app, using the RainPoint Home cloud.
 
 This plugin supports both. Select the provider that matches the app you set your devices up with.
 
