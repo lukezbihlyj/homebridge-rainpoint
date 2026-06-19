@@ -1,0 +1,59 @@
+{
+  "name": "homebridge-rainpoint",
+  "version": "1.0.0",
+  "displayName": "Homebridge RainPoint",
+  "description": "Homebridge plugin for RainPoint irrigation systems - control water timers, valves, and soil sensors via the RainPoint/HomGar cloud API.",
+  "author": "Luke Zbihlyj",
+  "maintainers": [
+    "lukezbihlyj"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukezbihlyj/homebridge-rainpoint.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lukezbihlyj/homebridge-rainpoint/issues"
+  },
+  "homepage": "https://github.com/lukezbihlyj/homebridge-rainpoint#readme",
+  "engines": {
+    "node": ">=18.0.0",
+    "homebridge": ">=1.6.0"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "lint": "eslint src/**.ts --max-warnings=0",
+    "watch": "npm run build && npm link && nodemon",
+    "build": "rimraf ./dist && tsc",
+    "prepublishOnly": "npm run lint && npm run build"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "rainpoint",
+    "homgar",
+    "irrigation",
+    "sprinkler",
+    "water",
+    "timer",
+    "valve",
+    "sensor",
+    "soil",
+    "moisture",
+    "garden",
+    "homekit"
+  ],
+  "dependencies": {
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^8.0.1",
+    "homebridge": "^1.6.0",
+    "nodemon": "^2.0.20",
+    "rimraf": "^3.0.2",
+    "ts-node": "^10.3.0",
+    "typescript": "^5.0.0"
+  }
+}

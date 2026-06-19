@@ -1,0 +1,148 @@
+{
+  "pluginAlias": "RainPoint",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "RainPoint integration supporting water timers, valves, and soil sensors via RainPoint Home and RainPoint TY cloud APIs.",
+  "footerDisplay": "Each irrigation zone will appear as a Valve accessory in HomeKit. Soil sensors will appear as Humidity and Temperature sensors.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "RainPoint",
+        "description": "The name that will appear in the Homebridge log."
+      },
+      "provider": {
+        "title": "Provider",
+        "type": "string",
+        "default": "home",
+        "oneOf": [
+          { "title": "RainPoint Home", "enum": ["home"] },
+          { "title": "RainPoint TY", "enum": ["ty"] }
+        ],
+        "description": "Which RainPoint app/provider you use."
+      },
+      "email": {
+        "title": "Email",
+        "type": "string",
+        "format": "email",
+        "description": "Your RainPoint account email address."
+      },
+      "password": {
+        "title": "Password",
+        "type": "string",
+        "description": "Your RainPoint account password.",
+        "x-schema-form": {
+          "type": "password"
+        }
+      },
+      "regionHome": {
+        "title": "Region",
+        "type": "string",
+        "default": "US",
+        "oneOf": [
+          { "title": "Americas / International (US)", "enum": ["US"] },
+          { "title": "China (CN)", "enum": ["CN"] }
+        ],
+        "description": "Select your region for the RainPoint Home provider."
+      },
+      "regionTy": {
+        "title": "Region",
+        "type": "string",
+        "default": "AZ",
+        "oneOf": [
+          { "title": "Americas (AZ)", "enum": ["AZ"] },
+          { "title": "Europe (EU)", "enum": ["EU"] },
+          { "title": "India (IN)", "enum": ["IN"] },
+          { "title": "China (CN)", "enum": ["CN"] }
+        ],
+        "description": "Select your region for the RainPoint TY provider."
+      },
+      "countryCode": {
+        "title": "Country Code",
+        "type": "string",
+        "default": "1",
+        "description": "Dialing code for your country (e.g. 1 for US, 91 for India, 86 for China). Only used with the RainPoint TY provider."
+      },
+      "homeIndex": {
+        "title": "Home Index",
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "Which home to use if you have multiple homes (0 = first home)."
+      },
+      "pollInterval": {
+        "title": "Poll Interval (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 10,
+        "maximum": 300,
+        "description": "How often to poll the cloud for device status updates (in seconds). Minimum 10 seconds."
+      },
+      "flatValves": {
+        "title": "Flat Valve Layout",
+        "type": "boolean",
+        "default": false,
+        "description": "If enabled, each irrigation zone appears as a standalone Valve accessory instead of being grouped under an IrrigationSystem accessory."
+      },
+      "debugmode": {
+        "title": "Debug Mode",
+        "type": "boolean",
+        "default": false,
+        "description": "Enable debug logging."
+      }
+    },
+    "required": [
+      "provider",
+      "email",
+      "password"
+    ]
+  },
+  "layout": [
+    {
+      "type": "fieldset",
+      "title": "Account Credentials",
+      "items": [
+        "provider",
+        {
+          "key": "regionHome",
+          "condition": { "functionBody": "return model.provider === 'home'" }
+        },
+        {
+          "key": "regionTy",
+          "condition": { "functionBody": "return model.provider === 'ty'" }
+        },
+        {
+          "key": "countryCode",
+          "condition": { "functionBody": "return model.provider === 'ty'" }
+        },
+        "email",
+        "password"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Connection Settings",
+      "items": [
+        "name",
+        "pollInterval"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Accessory Layout",
+      "items": [
+        "homeIndex",
+        "flatValves"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Advanced",
+      "items": [
+        "debugmode"
+      ]
+    }
+  ]
+}
