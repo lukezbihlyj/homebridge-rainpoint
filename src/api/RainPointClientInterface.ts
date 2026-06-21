@@ -37,6 +37,26 @@ export interface NormalizedDevice {
    * When omitted, the legacy port-number DP scheme (DP 1, 2, ...) is assumed.
    */
   zoneSwitchDps?: number[];
+  /**
+   * Per-zone resolved DP ids (from thing.m.product.thing.model). Each zone has
+   * the WorkStatus (run flag, enum "1"=running), ManualTimer (countdown minutes,
+   * writable 0-60), ManualSwitch (bool on/off), and RemainTime (remaining min,
+   * read-only) DPs. Resolved by code-name per zone, NOT by offset — the +51
+   * offset heuristic is wrong for multi-zone products (zone 2's WorkStatus is
+   * 153, not switchDp+2). When absent, fall back to zoneSwitchDps offsets.
+   */
+  zoneDps?: NormalizedZoneDps[];
+}
+
+export interface NormalizedZoneDps {
+  /** Run-state enum DP (rw, code WorkStatus/LeftWorkStatus/RightWorkStatus). */
+  workStatus: number;
+  /** Writable countdown timer DP (rw value, minutes, 0-60). */
+  manualTimer: number;
+  /** Writable on/off switch DP (rw bool). */
+  manualSwitch: number;
+  /** Read-only remaining-time DP (ro value, minutes). */
+  remainTime: number;
 }
 
 export interface NormalizedZoneStatus {

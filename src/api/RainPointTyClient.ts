@@ -50,6 +50,13 @@ const API_VERSIONS: Record<string, string> = {
   'thing.m.my.group.device.list': '2.1',
   'thing.m.device.dp.get': '1.0',
   'thing.m.device.dp.publish': '1.0',
+  // thing.m.product.thing.model (v1.0) {productId, productVersion} -> canonical
+  // DP schema (ThingSmartThingModel: services[] with properties{code,type,range}).
+  // The authoritative per-product DP definition list — the plugin fetches this
+  // once per productId to resolve each zone's WorkStatus/ManualTimer/ManualSwitch/
+  // RemainTime DPs by code (instead of hardcoding offsets like 104/155, which are
+  // wrong for multi-zone RainPoint products). Verified live 2026-06-20.
+  'thing.m.product.thing.model': '1.0',
 };
 
 // HMAC key format confirmed via Frida memory scan of libthing_security.so:
@@ -253,6 +260,33 @@ interface TuyaDpResult {
 interface TuyaStatusItem {
   code: string;
   value: unknown;
+}
+
+// thing.m.product.thing.model response (ThingSmartThingModel). The canonical
+// per-product DP schema: services[].properties[] each with {abilityId, code,
+// accessMode (ro/rw), typeSpec}. abilityId is the dpId; code is the human name
+// (WorkStatus, ManualTimer, ...); accessMode tells writable vs read-only.
+interface ThingModel {
+  modelId?: string;
+  productId?: string;
+  productVersion?: string;
+  services?: Array<{
+    code?: string;
+    properties?: ThingModelProperty[];
+  }>;
+}
+interface ThingModelProperty {
+  abilityId: number;
+  code?: string;
+  accessMode?: 'ro' | 'rw' | 'wr';
+  typeSpec?: {
+    type: string;
+    min?: number;
+    max?: number;
+    step?: number;
+    unit?: string;
+    range?: string[];
+  };
 }
 
 class TuyaApiError extends Error {
@@ -621,12 +655,10 @@ export class RainPointTyClient implements RainPointClient {
         continue;
       }
 
-      // Detect per-zone valve switch DPs from the device's datapoints. The
-      // RainPoint TY irrigation controller exposes each valve as a distinct DP:
-      //   zone 1 -> DP 104, zone 2 -> DP 155, zone 3 -> DP 206, ... (step 51)
-      // A "split" controller (e.g. Back Garden) has BOTH 104 and 155 => 2 zones.
-      // A single-valve controller has only 104 => 1 zone. We also honor dpName
-      // entries containing "Valve" as switch DPs (e.g. 155="Right Valve").
+      // Detect per-zone valve switch DPs from the device's datapoints (fallback
+      // only — used to count zones + name them when the product schema isn't
+      // available). The authoritative per-zone control/status DPs come from
+      // thing.m.product.thing.model below.
       const { zoneSwitchDps, zoneNames } = this.detectValveZones(device);
 
       devices.push({
@@ -636,8 +668,6 @@ export class RainPointTyClient implements RainPointClient {
         productId: device.productId || device.product_id || '',
         online: device.cloudOnline ?? device.online ?? (device.connectionStatus === 1),
         portNumber: zoneSwitchDps.length,
-        // Per-zone names: use dpName-derived names when available, else the device
-        // name for a single-zone device, else "Zone N".
         portDescribe: zoneNames,
         deviceType,
         isSubDevice,
@@ -650,7 +680,173 @@ export class RainPointTyClient implements RainPointClient {
     // Refresh the device cache so turnZoneOn/Off can resolve port -> switch DP.
     this.deviceCache = new Map(devices.map(d => [d.id, d]));
 
+    // Resolve per-zone control/status DPs from thing.m.product.thing.model.
+    // The thing.model returns the canonical DP schema (abilityId + code +
+    // accessMode + typeSpec) per product. RainPoint irrigation products expose
+    // per-zone blocks named WorkStatus/ManualTimer/ManualSwitch/RemainTime (for
+    // single-zone products) or Left*/Right* prefixed (for multi-zone). We group
+    // the properties by zone prefix and resolve each zone's run/timer/switch/
+    // remain DPs by code — this is the authoritative, model-independent mapping
+    // (the +51 offset heuristic was wrong for multi-zone: zone 2's WorkStatus
+    // is 153, not switchDp+2).
+    await this.resolveZoneDpsFromSchema(devices);
+
     return devices;
+  }
+
+  /**
+   * Fetch thing.m.product.thing.model for each distinct productId and resolve
+   * the per-zone control/status DPs (WorkStatus, ManualTimer, ManualSwitch,
+   * RemainTime) by code name. Populates device.zoneDps. Cached per productId for
+   * the process lifetime.
+   *
+   * Verified schema (live capture) for two RainPoint irrigation products:
+   *   ew946yrp3pgbaziu (1-zone): WorkStatus=106, ManualTimer=107,
+   *     ManualSwitch=108, LeftTime=109
+   *   pjnbcfv3bzwg4yyo (2-zone): zone1 Left* = 106/107/108/109,
+   *     zone2 Right* = 153/154/155/156
+   *
+   * For products without a thing.model (or without WorkStatus DPs), zoneDps is
+   * left undefined and the caller falls back to the +offset heuristic.
+   */
+  private productSchemaCache = new Map<string, ThingModelProperty[]>();
+  private async resolveZoneDpsFromSchema(devices: NormalizedDevice[]): Promise<void> {
+    const productIds = Array.from(new Set(devices.map(d => d.productId).filter(Boolean)));
+    for (const pid of productIds) {
+      if (this.productSchemaCache.has(pid) || pid === '(none)') {
+        continue;
+      }
+      try {
+        const model = await this.request<ThingModel>(
+          'thing.m.product.thing.model',
+          { productId: pid, productVersion: '1.0.0' },
+        );
+        const props = model?.services?.flatMap(s => s.properties ?? []) ?? [];
+        this.productSchemaCache.set(pid, props);
+        this.log.debug('[TY] thing.model for %s: %d properties', pid, props.length);
+      } catch (error) {
+        this.log.warn('[TY] Failed to fetch thing.model for %s: %s', pid, error);
+        this.productSchemaCache.set(pid, []);
+      }
+    }
+
+    // Resolve per-zone DPs. Group properties by zone prefix derived from the code:
+    // "WorkStatus" / "ManualTimer" etc -> zone prefix "" (single-zone)
+    // "LeftWorkStatus" / "RightManualTimer" etc -> "Left" / "Right"
+    // A zone is present if it has a WorkStatus property (the run-state anchor).
+    for (const device of devices) {
+      const props = this.productSchemaCache.get(device.productId);
+      if (!props || props.length === 0) {
+        continue;
+      }
+      const zones = this.groupPropertiesByZone(props);
+      if (zones.length === 0) {
+        continue;
+      }
+      device.zoneDps = zones.map(z => ({
+        workStatus: z.byCode.WorkStatus ?? z.byCode.ManualSwitch ?? 0,
+        manualTimer: z.byCode.ManualTimer ?? 0,
+        manualSwitch: z.byCode.ManualSwitch ?? 0,
+        remainTime: z.byCode.RemainTime ?? z.byCode.LeftTime ?? 0,
+      }));
+      // If the schema declared more zones than detectValveZones found (e.g. a
+      // 2-zone product where only zone-1's dps were present in the snapshot),
+      // trust the schema — it's the authoritative zone count.
+      if (zones.length > device.portNumber) {
+        device.portNumber = zones.length;
+        if (device.portDescribe.length < zones.length) {
+          for (let i = device.portDescribe.length; i < zones.length; i++) {
+            device.portDescribe.push(zones[i].name);
+          }
+        }
+      }
+      this.log.debug('[TY] %s resolved %d zone(s) from schema: %s',
+        device.name, zones.length, JSON.stringify(device.zoneDps));
+    }
+  }
+
+  /**
+   * Group thing.model properties into zones. RainPoint irrigation codes use a
+   * Left/Right prefix for multi-zone products and bare codes for single-zone —
+   * BUT some single-zone products ALSO have a `LeftTime` code where "Left" is
+   * part of the name, not a zone prefix. We distinguish them by checking whether
+   * the SAME role exists with both Left and Right prefixes: if both
+   * LeftWorkStatus and RightWorkStatus exist, the product is multi-zone and the
+   * prefix is a zone marker; otherwise bare codes form one zone.
+   *
+   * Returns one entry per zone, in zone order (Left before Right, unprefixed =
+   * single zone). Each zone's byCode map indexes the code WITHOUT its prefix
+   * (e.g. "RightWorkStatus" -> "WorkStatus") so the same lookup works per zone.
+   */
+  private groupPropertiesByZone(props: ThingModelProperty[]): Array<{ name: string; byCode: Record<string, number> }> {
+    // First pass: detect whether this product uses a Left/Right zone scheme.
+    // A role R is zone-prefixed if both LeftR and RightR appear as codes.
+    const codes = new Set(props.map(p => p.code ?? '').filter(Boolean));
+    const hasLeftRightZoneScheme = ['WorkStatus', 'ManualSwitch', 'ManualTimer'].some(role =>
+      codes.has(`Left${role}`) && codes.has(`Right${role}`),
+    );
+
+    const zones = new Map<string, Record<string, number>>();
+    for (const p of props) {
+      const code = p.code ?? '';
+      let prefix = '';
+      let role = code;
+      if (hasLeftRightZoneScheme) {
+        // Multi-zone: strip Left/Right prefix, it's a zone marker.
+        const m = code.match(/^(Left|Right)(.+)$/);
+        if (m) {
+          prefix = m[1];
+          role = m[2];
+        }
+      }
+      // Single-zone: keep the full code as the role (LeftTime stays LeftTime).
+      if (!zones.has(prefix)) {
+        zones.set(prefix, {});
+      }
+      zones.get(prefix)![role] = p.abilityId;
+    }
+    // A real irrigation zone has a WorkStatus (or ManualSwitch) anchor. Order:
+    // unprefixed first (single-zone), then Left, then Right, then any others.
+    const order = ['', 'Left', 'Right'];
+    const sortedPrefixes = Array.from(zones.keys()).sort((a, b) => {
+      const ia = order.indexOf(a);
+      const ib = order.indexOf(b);
+      if (ia !== -1 && ib !== -1) {
+        return ia - ib;
+      }
+      if (ia !== -1) {
+        return -1;
+      }
+      if (ib !== -1) {
+        return 1;
+      }
+      return a.localeCompare(b);
+    });
+    const DEFAULT_NAMES: Record<string, string> = { '': 'Valve', Left: 'Left Valve', Right: 'Right Valve' };
+    const result: Array<{ name: string; byCode: Record<string, number> }> = [];
+    for (const prefix of sortedPrefixes) {
+      const byCode = zones.get(prefix)!;
+      if (byCode.WorkStatus === undefined && byCode.ManualSwitch === undefined) {
+        continue;
+      }
+      result.push({ name: DEFAULT_NAMES[prefix] ?? prefix, byCode });
+    }
+    return result;
+  }
+
+  /**
+   * Public escape hatch for diagnostics / RE: call any Tuya mobile API action by
+   * name with arbitrary postData and return the raw decrypted response. Reuses
+   * the full request pipeline (signing, AES-GCM encrypt/decrypt, sid injection)
+   * so it exercises the EXACT same wire path as production calls. Used by the
+   * standalone schema-probe script archived in the homebridge-re-tools repo.
+   */
+  async debugRequest<T = unknown>(
+    action: string,
+    data: Record<string, unknown>,
+    requireSid: boolean | string = true,
+  ): Promise<T> {
+    return this.request<T>(action, data, requireSid);
   }
 
   async getDeviceStatuses(deviceIds: string[]): Promise<Map<string, NormalizedDeviceStatus>> {
@@ -669,34 +865,67 @@ export class RainPointTyClient implements RainPointClient {
           { devId: deviceId },
         );
 
+        // Verbose raw dump of the dp.get response — debug only (homebridge -D),
+        // since it fires every poll cycle. Useful when diagnosing a device that
+        // reports an unexpected state.
+        this.log.debug('[TY] dp.get for %s (%s): %s',
+          deviceId, device.name, JSON.stringify(statusResult));
+
         const dpsMap = new Map<string, unknown>();
         if (Array.isArray(statusResult)) {
+          // Some Tuya clouds return [{code, value}, ...] for dp.get.
           for (const item of statusResult) {
             dpsMap.set(item.code, item.value);
           }
         } else if (statusResult.dps) {
+          // Standard shape: {dps: {dpId: value, ...}}.
           for (const [key, value] of Object.entries(statusResult.dps)) {
             dpsMap.set(key, value);
           }
+        } else if (statusResult && typeof statusResult === 'object') {
+          // RainPoint TY private cloud returns dp.get as a FLAT object of
+          // {dpId: value, ...} with NO wrapping `dps` key (e.g.
+          // {"101":0,"104":false,"108":true,...}). Without this branch every
+          // poll yields an empty dpsMap, so isOn is always false and manual
+          // toggles never reflect in HomeKit. Treat the raw object as the dps
+          // map when it has numeric-string keys and no `dps`/array shape.
+          for (const [key, value] of Object.entries(statusResult)) {
+            dpsMap.set(key, value);
+          }
         }
+        this.log.debug('[TY] %s parsed dps=%s',
+          device.name, JSON.stringify(Object.fromEntries(dpsMap)));
 
         const zones: NormalizedZoneStatus[] = [];
         const switchDps = device.zoneSwitchDps;
+        const zoneDps = device.zoneDps;
         for (let port = 1; port <= device.portNumber; port++) {
-          // Use the per-zone switch DP when available (RainPoint TY pattern:
-          // 104 for zone 1, 155 for zone 2, ...). Fall back to the legacy
-          // port-number DP scheme (DP 1, 2, ...) for devices without zoneSwitchDps.
-          const switchDp = switchDps?.[port - 1];
-          const isOn = switchDp !== undefined
-            ? dpsMap.get(String(switchDp)) === true
-            : (dpsMap.get(String(port)) === true || dpsMap.get(`switch_${port}`) === true);
+          // Valve state is read from the per-zone WorkStatus DP (run-state enum,
+          // "1"=running) resolved from thing.m.product.thing.model. The switch DP
+          // (104/155) is a "valve installed" config flag that stays false while
+          // running — reading it always reported OFF.
+          //
+          // WorkStatus is an enum; "1" = running, anything else = idle. RemainTime
+          // (or LeftTime on single-zone products) is the remaining minutes; HomeKit
+          // expects seconds so we ×60.
+          //
+          // Fallback when zoneDps is absent (no thing.model): use the empirical
+          // +offset from the switch DP (run = switch+2, remain = switch+3). This
+          // is only correct for the 1-zone product ew946yrp3pgbaziu and is WRONG
+          // for multi-zone (zone 2 WorkStatus is 153, not switchDp+2). The schema
+          // path above is authoritative.
+          const zd = zoneDps?.[port - 1];
+          const runDp = zd?.workStatus ?? (switchDps?.[port - 1] !== undefined ? switchDps[port - 1]! + 2 : undefined);
+          const remainingDp = zd?.remainTime ?? (switchDps?.[port - 1] !== undefined ? switchDps[port - 1]! + 3 : undefined);
+          const runValue = runDp !== undefined ? dpsMap.get(String(runDp)) : undefined;
+          const isOn = String(runValue) === '1';
 
-          // Countdown/remaining duration: best-effort. The RainPoint TY countdown
-          // DP isn't at a consistent offset from the switch DP across valve groups,
-          // so we don't try to read it here — the InUse characteristic falls back
-          // to 0 (not running), which is safe. A future capture of an active valve
-          // can pin down the countdown DP per zone.
-          const remaining = 0;
+          const remainingMin = remainingDp !== undefined
+            ? Number(dpsMap.get(String(remainingDp)))
+            : NaN;
+          const remaining = Number.isFinite(remainingMin) && remainingMin > 0
+            ? Math.round(remainingMin * 60)
+            : 0;
 
           zones.push({
             port,
@@ -730,34 +959,78 @@ export class RainPointTyClient implements RainPointClient {
   }
 
   async turnZoneOn(deviceId: string, port: number, durationSeconds?: number): Promise<void> {
-    // qqddbpb.smali dp.publish: postData requires gwId + devId + dps (as JSON string).
-    // For non-sub-devices gwId == devId (the device is its own gateway).
-    // The DP key for the valve on/off is the per-zone switch DP (RainPoint TY:
-    // 104 for zone 1, 155 for zone 2, ...) when known; otherwise fall back to
-    // the legacy port-number DP scheme (DP 1, 2, ...).
-    const switchDp = this.resolveSwitchDp(deviceId, port);
-    const dps: Record<string, unknown> = { [String(switchDp)]: true };
-    if (durationSeconds) {
-      // Countdown DP is unknown per-zone for the TY scheme; omit rather than
-      // risk writing the wrong DP. The valve still turns on; only the auto-off
-      // timer isn't set server-side (HomeKit's SetDuration handles local timing).
+    // RainPoint TY valve control — VERIFIED semantics (live test 2026-06-20):
+    //   ManualSwitch = false  → START the valve
+    //   ManualSwitch = true   → STOP the valve
+    //   ManualTimer = N       → run duration in minutes (sets the countdown)
+    // The "switch" is INVERTED (false=on). Writing true when it's already true is a
+    // no-op — earlier attempts failed because 108 was stuck at true from a prior
+    // stop. To start reliably we set ManualTimer=N AND ManualSwitch=false together.
+    //
+    // gwId must be the parent gateway's devId for sub-devices (qqddbpb.smali
+    // dp.publish requires gwId + devId + dps; gwId==devId for sub-devices is silently
+    // accepted but never reaches the device).
+    const device = this.deviceCache.get(deviceId);
+    const zoneDp = device?.zoneDps?.[port - 1];
+    const manualTimerDp = zoneDp?.manualTimer
+      ?? (this.resolveSwitchDp(deviceId, port) + 3);
+    const manualSwitchDp = zoneDp?.manualSwitch;
+    const gwId = this.resolveGwId(deviceId);
+    // HomeKit SetDuration is in SECONDS; ManualTimer is in MINUTES (typeSpec max 60).
+    // Convert seconds→minutes, clamp to [1,60]. Default 10 min if no duration.
+    const durationMin = durationSeconds
+      ? Math.min(60, Math.max(1, Math.round(durationSeconds / 60)))
+      : 10;
+    // START = ManualTimer=N + ManualSwitch=false (the false is what triggers the run).
+    const dps: Record<string, unknown> = { [String(manualTimerDp)]: durationMin };
+    if (manualSwitchDp) {
+      dps[String(manualSwitchDp)] = false;
     }
-    await this.request('thing.m.device.dp.publish', {
-      gwId: deviceId,
+    // The accessory layer logs the user-facing "Setting <zone> to ON" at info;
+    // this lower-level dp detail is debug only to avoid duplicating every toggle.
+    this.log.debug('[TY] dp.publish ON: devId=%s gwId=%s port=%d dps=%s',
+      deviceId, gwId, port, JSON.stringify(dps));
+    const result = await this.request('thing.m.device.dp.publish', {
+      gwId,
       devId: deviceId,
       dps: JSON.stringify(dps),
     });
-    this.log.debug('Turned ON zone %d (DP %s) on device %s', port, switchDp, deviceId);
+    this.log.debug('[TY] dp.publish ON result for %s: %s', deviceId, JSON.stringify(result));
   }
 
   async turnZoneOff(deviceId: string, port: number): Promise<void> {
-    const switchDp = this.resolveSwitchDp(deviceId, port);
-    await this.request('thing.m.device.dp.publish', {
-      gwId: deviceId,
+    // STOP = ManualSwitch=true + ManualTimer=0 (clear the countdown).
+    const device = this.deviceCache.get(deviceId);
+    const zoneDp = device?.zoneDps?.[port - 1];
+    const manualTimerDp = zoneDp?.manualTimer
+      ?? (this.resolveSwitchDp(deviceId, port) + 3);
+    const gwId = this.resolveGwId(deviceId);
+    const dps: Record<string, unknown> = { [String(manualTimerDp)]: 0 };
+    if (zoneDp?.manualSwitch) {
+      dps[String(zoneDp.manualSwitch)] = true;
+    }
+    this.log.debug('[TY] dp.publish OFF: devId=%s gwId=%s port=%d dps=%s',
+      deviceId, gwId, port, JSON.stringify(dps));
+    const result = await this.request('thing.m.device.dp.publish', {
+      gwId,
       devId: deviceId,
-      dps: JSON.stringify({ [String(switchDp)]: false }),
+      dps: JSON.stringify(dps),
     });
-    this.log.debug('Turned OFF zone %d (DP %s) on device %s', port, switchDp, deviceId);
+    this.log.debug('[TY] dp.publish OFF result for %s: %s', deviceId, JSON.stringify(result));
+  }
+
+  /**
+   * Resolve the gateway devId for a dp.publish command. RainPoint TY irrigation
+   * zones are sub-devices of a parent gateway; the cloud forwards the DP to the
+   * gateway, which relays it to the sub-device. If the cached device has a
+   * parentId, use it; otherwise the device is its own gateway (gwId == devId).
+   */
+  private resolveGwId(deviceId: string): string {
+    const device = this.deviceCache.get(deviceId);
+    if (device?.parentId) {
+      return device.parentId;
+    }
+    return deviceId;
   }
 
   /**
