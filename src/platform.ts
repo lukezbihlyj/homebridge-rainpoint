@@ -329,9 +329,12 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       });
     }
 
-    const moisture = (parsedDps['9'] ?? parsedDps['14'] ?? parsedDps['humidity'] ?? parsedDps['soil_humidity'] ?? null) as number | null;
-    const temperature = (parsedDps['10'] ?? parsedDps['15'] ?? parsedDps['temperature'] ?? parsedDps['temp_current'] ?? null) as number | null;
-    const battery = (parsedDps['11'] ?? parsedDps['17'] ?? parsedDps['battery_percentage'] ?? parsedDps['residual_electricity'] ?? null) as number | null;
+    const moisture = (parsedDps['9'] ?? parsedDps['14'] ?? parsedDps['humidity']
+      ?? parsedDps['soil_humidity'] ?? null) as number | null;
+    const temperature = (parsedDps['10'] ?? parsedDps['15'] ?? parsedDps['temperature']
+      ?? parsedDps['temp_current'] ?? null) as number | null;
+    const battery = (parsedDps['11'] ?? parsedDps['17'] ?? parsedDps['battery_percentage']
+      ?? parsedDps['residual_electricity'] ?? null) as number | null;
 
     const status: NormalizedDeviceStatus = {
       deviceId: targetDeviceId,
@@ -529,11 +532,15 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
           const device = this.normalizedDevices.get(deviceId);
           for (const zone of status.zones) {
             const zoneDp = device?.zoneDps?.[zone.port - 1];
-            if (!zoneDp) continue;
+            if (!zoneDp) {
+              continue;
+            }
             seeded[String(zoneDp.workStatus)] = zone.isOn ? '1' : '0';
             if (zone.remainingDuration > 0) {
               const min = Math.round(zone.remainingDuration / 60);
-              if (min > 0) seeded[String(zoneDp.manualTimer)] = min;
+              if (min > 0) {
+                seeded[String(zoneDp.manualTimer)] = min;
+              }
             }
           }
           this.mqttDpAccumulator.set(deviceId, seeded);
