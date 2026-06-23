@@ -1524,15 +1524,25 @@ export class RainPointTyClient implements RainPointClient {
   }
 
   async turnZoneOff(deviceId: string, port: number): Promise<void> {
-    // STOP = ManualSwitch=true + ManualTimer=0 (clear the countdown).
+    // STOP = ManualSwitch=true only. We do NOT zero ManualTimer (107/154):
+    //   - ManualSwitch=true is what actually stops the valve (verified live).
+    //   - Zeroing ManualTimer wipes the saved duration, so the RainPoint app's
+    //     manual-control slider shows 0 after a stop. Leaving ManualTimer at
+    //     its last value lets the app's slider retain the set duration, matching
+    //     the app's own pause behavior (pause stops the run but keeps the slider).
     const device = this.deviceCache.get(deviceId);
     const zoneDp = device?.zoneDps?.[port - 1];
-    const manualTimerDp = zoneDp?.manualTimer
-      ?? (this.resolveSwitchDp(deviceId, port) + 3);
     const gwId = this.resolveGwId(deviceId);
-    const dps: Record<string, unknown> = { [String(manualTimerDp)]: 0 };
+    const dps: Record<string, unknown> = {};
     if (zoneDp?.manualSwitch) {
       dps[String(zoneDp.manualSwitch)] = true;
+    } else {
+      // Fallback: no resolved manualSwitch DP — stop by clearing the run flag
+      // via ManualTimer=0. This is the older path and has the slider-reset side
+      // effect, but stops the valve when we don't have the switch DP id.
+      const manualTimerDp = zoneDp?.manualTimer
+        ?? (this.resolveSwitchDp(deviceId, port) + 3);
+      dps[String(manualTimerDp)] = 0;
     }
     this.log.debug('[TY] dp.publish OFF: devId=%s gwId=%s port=%d dps=%s',
       deviceId, gwId, port, JSON.stringify(dps));
