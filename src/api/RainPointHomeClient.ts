@@ -13,18 +13,12 @@ import {
 } from './types';
 
 import {
-  getBaseUrl,
   getDeviceType,
-  API_VERSION,
-  APP_CODE,
-  SCENE_TYPE,
   DEVICE_TYPE_GATEWAY,
   DEVICE_TYPE_SENSOR,
   DEVICE_TYPE_VALVE,
   DEVICE_TYPE_CONTROLLER,
   DEVICE_TYPE_IRRIGATION,
-  CONTROL_MODE_OPEN,
-  CONTROL_MODE_CLOSE,
 } from './constants';
 
 import { decodeValve, decodeSensor } from './home-decoder';
@@ -37,6 +31,30 @@ import {
   NormalizedDeviceStatus,
   NormalizedZoneStatus,
 } from './RainPointClientInterface';
+
+// =============================================================================
+// RainPoint Home (HomGar cloud API) constants — module-private, used only by
+// this client. Mirrors how RainPointTyClient keeps its own protocol constants
+// colocated and private rather than in the shared constants.ts.
+// =============================================================================
+
+const API_BASE_URL = 'https://region{areaCode}.homgarus.com:1443/';
+const API_VERSION = '1.16.1065';
+const APP_CODE = '2';
+const SCENE_TYPE = '1';
+
+const AREA_CODE_CN = '0';
+const AREA_CODE_INTERNATIONAL = '3';
+
+// controlWorkMode `mode` field values (verified against the battle-tested
+// ha-rainpoint integration): 1 = open valve, 0 = close valve.
+const CONTROL_MODE_CLOSE = 0;
+const CONTROL_MODE_OPEN = 1;
+
+function getBaseUrl(region: string): string {
+  const areaCode = region === 'CN' ? AREA_CODE_CN : AREA_CODE_INTERNATIONAL;
+  return API_BASE_URL.replace('{areaCode}', areaCode);
+}
 
 
 function md5(input: string): string {
