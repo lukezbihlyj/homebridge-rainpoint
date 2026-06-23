@@ -1,8 +1,8 @@
 export const API_BASE_URL = 'https://region{areaCode}.homgarus.com:1443/';
 export const API_PORT = 1443;
-export const API_VERSION = '1.16.1057';
+export const API_VERSION = '1.16.1065';
 export const APP_CODE = '2';
-export const SCENE_TYPE = '0';
+export const SCENE_TYPE = '1';
 
 export const AREA_CODE_CN = '0';
 export const AREA_CODE_INTERNATIONAL = '3';
@@ -25,10 +25,11 @@ export const CTRL_PLAN = 4;
 export const CTRL_PLATFORM = 5;
 export const CTRL_VOICE = 6;
 
-export const CONTROL_MODE_NEXT = 0;
-export const CONTROL_MODE_MANUAL = 1;
-export const CONTROL_MODE_SMART = 2;
-export const CONTROL_MODE_CYCLE = 3;
+// controlWorkMode `mode` field values (verified against the battle-tested
+// ha-rainpoint integration): 1 = open valve, 0 = close valve. The earlier
+// NEXT/MANUAL scheme was a misread of the app capture.
+export const CONTROL_MODE_CLOSE = 0;
+export const CONTROL_MODE_OPEN = 1;
 
 export const DP_TYPE_PARAM = 0;
 export const DP_TYPE_STATUS = 1;
@@ -44,8 +45,6 @@ export const DP_CODE_PLAN_INFO = 21;
 export const DP_CODE_PLAN_CONFIG = 22;
 export const DP_CODE_WARNINGS = 27;
 export const DP_CODE_MODEL_CODE = 33;
-
-export const STOP_ALL_PARAM = '060F0000000000';
 
 export const DEVICE_TYPE_CONTROLLER = 'HCC';
 export const DEVICE_TYPE_SENSOR = 'HCS';
@@ -68,36 +67,4 @@ export function getDeviceType(model: string): string {
 export function getBaseUrl(region: string): string {
   const areaCode = region === 'CN' ? AREA_CODE_CN : AREA_CODE_INTERNATIONAL;
   return API_BASE_URL.replace('{areaCode}', areaCode);
-}
-
-export function prefixParamZero(n: number, byteLength: number = 1, reverse: boolean = true): string {
-  const hexLength = 2 * byteLength;
-  let value = n;
-  if (value < 0) {
-    value += Math.pow(2, 8 * byteLength);
-  }
-  let result = (Array(hexLength).join('0') + value.toString(16).toUpperCase()).slice(-hexLength);
-  if (reverse && byteLength > 1) {
-    result = reverseParam(result);
-  }
-  return result;
-}
-
-export function reverseParam(hexString: string): string {
-  if (hexString.length % 2 !== 0) return '';
-  let result = '';
-  for (let i = 0; i < hexString.length; i += 2) {
-    result = hexString.substring(i, i + 2) + result;
-  }
-  return result;
-}
-
-export function buildZoneOnParam(zoneIndex: number): string {
-  const zoneBitmask = 1 << (zoneIndex - 1);
-  return '03' + prefixParamZero(zoneBitmask, 1) + '0000';
-}
-
-export function buildZoneOnWithDurationParam(zoneIndex: number, durationMinutes: number): string {
-  const zoneBitmask = 1 << (zoneIndex - 1);
-  return prefixParamZero(zoneBitmask, 1) + '00' + prefixParamZero(durationMinutes, 1);
 }

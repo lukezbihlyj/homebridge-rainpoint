@@ -834,6 +834,7 @@ export class RainPointTyClient implements RainPointClient {
         name: device.name,
         model: device.model || device.productVer || device.productId || '',
         productId: device.productId || device.product_id || '',
+        deviceName: device.devId || device.id || '',
         online: device.cloudOnline ?? device.online ?? (device.connectionStatus === 1),
         portNumber: zoneSwitchDps.length,
         portDescribe: zoneNames,

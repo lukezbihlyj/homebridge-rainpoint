@@ -23,6 +23,12 @@ export interface NormalizedDevice {
   name: string;
   model: string;
   productId: string;
+  /**
+   * Cloud deviceName (MAC-based identifier) used in control + status requests.
+   * For sub-devices this is the sub-device's own deviceName; control requests
+   * must use the parent hub's deviceName, resolved via parentId at call time.
+   */
+  deviceName: string;
   online: boolean;
   portNumber: number;
   portDescribe: string[];

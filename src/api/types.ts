@@ -207,11 +207,6 @@ export interface DParam {
   value: string;
 }
 
-export interface ControlResponse {
-  state: string;
-  timestamp: number;
-}
-
 export interface RealtimeStateResponse {
   timestamp: number;
   state: string;
@@ -247,19 +242,7 @@ export interface ControlWorkModeParams {
   mode: number;
   addr: number;
   port: number;
-  param: string;
   duration: number;
-}
-
-export interface ControlWorkModeDPParams {
-  mid: string;
-  productKey: string;
-  deviceName: string;
-  mode: number;
-  addr: number;
-  port: number;
-  param: string;
-  dpCode: number;
 }
 
 export interface RecDeviceModel {
