@@ -72,6 +72,10 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
   // push into the existing set before deriving zone state — otherwise a push
   // for DP 107 alone would zero out 106/109 and flicker the valve OFF.
   private mqttDpAccumulator: Map<string, Record<string, unknown>> = new Map();
+  // Cached NormalizedDevice records from the last discovery. Used to resolve
+  // a device's zoneDps (workStatus/manualTimer/manualSwitch DPs per zone)
+  // when re-seeding the accumulator from a polled status snapshot.
+  private normalizedDevices: Map<string, NormalizedDevice> = new Map();
   // Sub-device routing for MQTT DP pushes. TY DP pushes arrive on the
   // GATEWAY's topic `smart/mb/in/{gwId}` with a `cid` field identifying the
   // sub-device (mesh node). This map keys `${gwId}/${cid}` -> sub-device
@@ -169,9 +173,11 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       this.discoveredDeviceIds.clear();
       this.subDeviceByGwCid.clear();
       this.gatewayDevIds.clear();
+      this.normalizedDevices.clear();
 
       for (const device of devices) {
         this.registerDevice(device);
+        this.normalizedDevices.set(device.id, device);
         // Build the (gwId, cid) -> sub-device devId routing map for MQTT DP
         // pushes. cid == the sub-device's mesh nodeId. Also record gateway
         // devIds (the parentId) so handleMqttStatusUpdate can detect that a
@@ -203,11 +209,20 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
         // When it disconnects, restart polling as a fallback.
         tyClient.setOnMqttConnect((connected: boolean) => {
           if (connected) {
-            this.log.info('MQTT connected — stopping polling (real-time updates active)');
-            if (this.pollTimer) {
-              clearInterval(this.pollTimer);
-              this.pollTimer = null;
-            }
+            // MQTT session is clean:true — messages sent during the disconnect
+            // gap are NOT queued by the broker. Run a one-shot catch-up poll
+            // right now so any state change that happened while disconnected is
+            // reflected, THEN stop the interval (real-time updates take over).
+            // pollStatus() also re-seeds the MQTT DP accumulator from the fresh
+            // snapshot so the next MQTT push merges into current state, not
+            // the stale pre-disconnect accumulator.
+            this.log.info('MQTT connected — catch-up poll then stopping interval');
+            this.pollStatus().finally(() => {
+              if (this.pollTimer) {
+                clearInterval(this.pollTimer);
+                this.pollTimer = null;
+              }
+            });
           } else {
             this.log.info('MQTT disconnected — restarting polling as fallback');
             this.startPolling();
@@ -327,7 +342,7 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       battery,
     };
 
-    this.log.info('[TY] MQTT: routed status for gw=%s cid=%s -> sub-device=%s zones=%d (run=%s timer=%s)',
+    this.log.debug('[TY] MQTT: routed status for gw=%s cid=%s -> sub-device=%s zones=%d (run=%s timer=%s)',
       deviceId, cid || '-', targetDeviceId, zones.length,
       zones[0]?.isOn ?? '-', zones[0]?.remainingDuration ?? '-');
 
@@ -504,6 +519,25 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       const statuses = await this.client.getDeviceStatuses(deviceIds);
       for (const [deviceId, status] of statuses) {
         this.deviceStatusMap.set(deviceId, status);
+        // Re-seed the MQTT DP accumulator from the fresh REST snapshot so
+        // the next MQTT push merges into current state, not stale DPs from
+        // before a disconnect. We only set the zone run + timer DPs (the
+        // ones MQTT pushes update) — other DPs (moisture/temp/battery) are
+        // carried by the NormalizedDeviceStatus directly, not the accumulator.
+        if (this.provider === 'ty') {
+          const seeded: Record<string, unknown> = {};
+          const device = this.normalizedDevices.get(deviceId);
+          for (const zone of status.zones) {
+            const zoneDp = device?.zoneDps?.[zone.port - 1];
+            if (!zoneDp) continue;
+            seeded[String(zoneDp.workStatus)] = zone.isOn ? '1' : '0';
+            if (zone.remainingDuration > 0) {
+              const min = Math.round(zone.remainingDuration / 60);
+              if (min > 0) seeded[String(zoneDp.manualTimer)] = min;
+            }
+          }
+          this.mqttDpAccumulator.set(deviceId, seeded);
+        }
       }
       this.updateAccessories();
     } catch (error) {

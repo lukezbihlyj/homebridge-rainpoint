@@ -744,7 +744,7 @@ export class RainPointTyClient implements RainPointClient {
     this.saveSession();
     this.log.info('Logged in to RainPoint TY API as %s', this.config.email);
     if (this.partnerIdentity) {
-      this.log.info('[TY] partnerIdentity=%s, mqttBroker=%s:%d',
+      this.log.debug('[TY] partnerIdentity=%s, mqttBroker=%s:%d',
         this.partnerIdentity, this.mqttBroker, this.mqttPort);
     }
   }
@@ -1097,8 +1097,9 @@ export class RainPointTyClient implements RainPointClient {
     // device state changes. One topic per device, no wildcards (ACL blocks them).
     const deviceTopics = deviceIds.map(id => `smart/mb/in/${id}`);
 
-    this.log.info('[TY] MQTT: connecting to %s (clientId=%s..., userTopic=%s, deviceTopics=%d)',
-      url, clientId.slice(0, 24), userTopic, deviceTopics.length);
+    this.log.info('[TY] MQTT: connecting to %s (%d device topics)',
+      url, deviceTopics.length);
+    this.log.debug('[TY] MQTT: clientId=%s..., userTopic=%s', clientId.slice(0, 24), userTopic);
 
     // Last Will & Testament (LWT). The Tuya SDK registers a will on the
     // CONNECT packet (MqttModel.smali:3036) — the broker uses this as a
@@ -1141,7 +1142,7 @@ export class RainPointTyClient implements RainPointClient {
 
       this.mqttClient.on('connect', () => {
         this.mqttConnected = true;
-        this.log.info('[TY] MQTT: connected to %s', brokerHost);
+        this.log.debug('[TY] MQTT: socket connected to %s', brokerHost);
         // Subscribe to the user topic + one per-device topic for each
         // discovered device. The broker's ACL rejects wildcard filters
         // (`#`, `smart/mb/#`) with granted=128 (0x80), which mqtt.js treats
@@ -1156,7 +1157,7 @@ export class RainPointTyClient implements RainPointClient {
             this.log.info('[TY] MQTT: subscribed to %d topic(s)', topics.length);
             if (granted) {
               for (const g of granted) {
-                this.log.info('[TY] MQTT: granted qos=%d for %s', g.qos, g.topic);
+                this.log.debug('[TY] MQTT: granted qos=%d for %s', g.qos, g.topic);
               }
             }
           }
@@ -1168,13 +1169,13 @@ export class RainPointTyClient implements RainPointClient {
       });
 
       this.mqttClient.on('message', (topic: string, payload: Buffer) => {
-        this.log.info('[TY] MQTT: message on topic=%s (%d bytes)', topic, payload.length);
+        this.log.debug('[TY] MQTT: message on topic=%s (%d bytes)', topic, payload.length);
         this.handleMqttPayload(payload, topic);
       });
 
       this.mqttClient.on('close', () => {
         this.mqttConnected = false;
-        this.log.info('[TY] MQTT: disconnected — falling back to polling');
+        this.log.debug('[TY] MQTT: socket closed — falling back to polling');
         // Notify platform to restart polling
         if (this.onMqttConnect) {
           this.onMqttConnect(false);
@@ -1191,12 +1192,12 @@ export class RainPointTyClient implements RainPointClient {
       this.mqttClient.on('packetsend', (packet) => {
         const p = packet as { cmd: string };
         const s = JSON.stringify(packet);
-        this.log.info('[TY] MQTT >> %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
+        this.log.debug('[TY] MQTT >> %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
       });
       this.mqttClient.on('packetreceive', (packet) => {
         const p = packet as { cmd: string };
         const s = JSON.stringify(packet);
-        this.log.info('[TY] MQTT << %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
+        this.log.debug('[TY] MQTT << %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
       });
     } catch (e) {
       this.log.warn('[TY] MQTT: connection failed: %s', e);
@@ -1231,11 +1232,11 @@ export class RainPointTyClient implements RainPointClient {
 
     if (prefix === '2.2' || prefix === '2.3' || prefix === '2.1' || prefix === '1.1') {
       // Tuya Thing binary frame — decrypt with the topic device's localKey.
-      this.log.info('[TY] MQTT: received %s binary frame on %s (%d bytes)',
+      this.log.debug('[TY] MQTT: received %s binary frame on %s (%d bytes)',
         prefix, topic || '?', payload.length);
       try {
         msg = this.parseTuyaBinaryFrame(payload, topic);
-        this.log.info('[TY] MQTT: %s frame decrypted: %s',
+        this.log.debug('[TY] MQTT: %s frame decrypted: %s',
           prefix, JSON.stringify(msg).length > 300
             ? JSON.stringify(msg).substring(0, 300) + '...' : JSON.stringify(msg));
       } catch (e) {
@@ -1246,7 +1247,7 @@ export class RainPointTyClient implements RainPointClient {
     } else {
       // Plaintext JSON (user topic, tylink/, etc.)
       const payloadStr = payload.toString('utf8');
-      this.log.info('[TY] MQTT: received message on %s (%d bytes): %s',
+      this.log.debug('[TY] MQTT: received message on %s (%d bytes): %s',
         topic || '?', payload.length,
         payloadStr.length > 200 ? payloadStr.substring(0, 200) + '...' : payloadStr);
       try {
@@ -1323,23 +1324,23 @@ export class RainPointTyClient implements RainPointClient {
     const protocol = msg.protocol as number;
     const msgType = msg.type as string;
 
-    this.log.info('[TY] MQTT: parsed msg: deviceId=%s protocol=%s type=%s',
+    this.log.debug('[TY] MQTT: parsed msg: deviceId=%s protocol=%s type=%s',
       deviceId || '(none)', protocol, msgType || '(none)');
 
     if (!deviceId || !data) {
-      this.log.info('[TY] MQTT: skipping msg without deviceId/data');
+      this.log.debug('[TY] MQTT: skipping msg without deviceId/data');
       return;
     }
 
     // Only handle DP data changes (protocol=4 or type="dp").
     if (protocol !== 4 && msgType !== 'dp') {
-      this.log.info('[TY] MQTT: skipping non-DP msg (protocol=%s type=%s)', protocol, msgType);
+      this.log.debug('[TY] MQTT: skipping non-DP msg (protocol=%s type=%s)', protocol, msgType);
       return;
     }
 
     const dps = data.dps as Record<string, unknown> | undefined;
     if (!dps) {
-      this.log.info('[TY] MQTT: msg has no dps field, data keys: %s', Object.keys(data).join(','));
+      this.log.debug('[TY] MQTT: msg has no dps field, data keys: %s', Object.keys(data).join(','));
       return;
     }
 
