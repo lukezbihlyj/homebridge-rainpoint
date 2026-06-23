@@ -9,7 +9,10 @@ import {
   UnknownContext,
 } from 'homebridge';
 
-import { PLATFORM_NAME, PLUGIN_NAME } from './settings';
+import type { NormalizedZoneStatus } from './api/RainPointClientInterface';
+import {
+  PLATFORM_NAME, PLUGIN_NAME,
+} from './settings';
 import {
   RainPointClient,
   Provider,
@@ -64,6 +67,19 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
   private accessoryHandlers: Map<string, ValveAccessory | SensorAccessory | IrrigationSystemAccessory> = new Map();
   private deviceStatusMap: Map<string, NormalizedDeviceStatus> = new Map();
   private discoveredDeviceIds: Set<string> = new Set();
+  // Per-sub-device accumulator of the latest DPs from MQTT pushes. Each TY
+  // MQTT push carries only ONE DP (e.g. {"107":10}), so we must merge each
+  // push into the existing set before deriving zone state — otherwise a push
+  // for DP 107 alone would zero out 106/109 and flicker the valve OFF.
+  private mqttDpAccumulator: Map<string, Record<string, unknown>> = new Map();
+  // Sub-device routing for MQTT DP pushes. TY DP pushes arrive on the
+  // GATEWAY's topic `smart/mb/in/{gwId}` with a `cid` field identifying the
+  // sub-device (mesh node). This map keys `${gwId}/${cid}` -> sub-device
+  // devId so the push is applied to the correct valve accessory. Built in
+  // discoverDevices() from each NormalizedDevice's parentId + nodeId.
+  private subDeviceByGwCid: Map<string, string> = new Map();
+  // Reverse: gateway devId -> true, for quick "is this devId a gateway" checks.
+  private gatewayDevIds: Set<string> = new Set();
 
   constructor(
     public readonly log: Logger,
@@ -151,16 +167,172 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       this.log.info('Found %d device(s)', devices.length);
 
       this.discoveredDeviceIds.clear();
+      this.subDeviceByGwCid.clear();
+      this.gatewayDevIds.clear();
 
       for (const device of devices) {
         this.registerDevice(device);
+        // Build the (gwId, cid) -> sub-device devId routing map for MQTT DP
+        // pushes. cid == the sub-device's mesh nodeId. Also record gateway
+        // devIds (the parentId) so handleMqttStatusUpdate can detect that a
+        // push's deviceId is a gateway and remap via cid.
+        if (device.parentId) {
+          this.gatewayDevIds.add(device.parentId);
+          if (device.nodeId) {
+            this.subDeviceByGwCid.set(`${device.parentId}/${device.nodeId}`, device.id);
+          }
+        }
       }
 
       this.cleanupStaleAccessories();
+
+      // Set up MQTT for real-time DP updates before starting polling.
+      // The client connects to the Tuya broker using credentials derived
+      // from the login session (sid, ecode, uid, partnerIdentity) and
+      // subscribes to per-device topics `smart/mb/in/{devId}` for each
+      // discovered device — that is where real-time DP pushes actually
+      // arrive (verified from the decompiled app:
+      // com.thingclips.sdk.device.pbpqqdp:2301). The user topic
+      // {partnerIdentity}/mb/{uid} only carries user-level events.
+      if (this.provider === 'ty') {
+        const tyClient = this.client as RainPointTyClient;
+        tyClient.setOnStatusUpdate((deviceId: string, dps: Map<string, unknown>, cid?: string) => {
+          this.handleMqttStatusUpdate(deviceId, dps, cid);
+        });
+        // When MQTT connects, stop polling (MQTT is the source of truth).
+        // When it disconnects, restart polling as a fallback.
+        tyClient.setOnMqttConnect((connected: boolean) => {
+          if (connected) {
+            this.log.info('MQTT connected — stopping polling (real-time updates active)');
+            if (this.pollTimer) {
+              clearInterval(this.pollTimer);
+              this.pollTimer = null;
+            }
+          } else {
+            this.log.info('MQTT disconnected — restarting polling as fallback');
+            this.startPolling();
+          }
+        });
+        // Build the MQTT subscription device-id list. Sub-device (valve) DP
+        // pushes are reported by their gateway and arrive on the GATEWAY's
+        // topic `smart/mb/in/{gwId}`, not the sub-device's own topic. The
+        // gateway device itself is skipped by getDevices() (see
+        // RainPointTyClient.getDevices), so discoveredDeviceIds only holds
+        // sub-device devIds. Add each sub-device's parentId (the gateway
+        // devId) so we subscribe to the gateway topics too. Dedup via Set.
+        const mqttDevIds = new Set<string>(this.discoveredDeviceIds);
+        for (const device of devices) {
+          if (device.parentId) {
+            mqttDevIds.add(device.parentId);
+          }
+        }
+        tyClient.connectMqtt(Array.from(mqttDevIds));
+      }
+
+      // Start polling initially — will be stopped once MQTT connects
       this.startPolling();
     } catch (error) {
       this.log.error('Failed to discover devices:', error);
     }
+  }
+
+  /**
+   * Handle a real-time DP update from MQTT. Builds a minimal
+   * NormalizedDeviceStatus from the incoming DPs and updates the device
+   * status map, then pushes to all accessories. This bypasses the poll cycle
+   * for faster state reflection (the app relies on MQTT push, not polling).
+   */
+  private handleMqttStatusUpdate(deviceId: string, dps: Map<string, unknown>, cid?: string): void {
+    // TY DP pushes arrive on the GATEWAY's topic (deviceId == gwId) with a
+    // `cid` identifying the sub-device. Remap to the sub-device devId so the
+    // status is applied to the correct valve accessory. If the push's
+    // deviceId is already a known sub-device (non-gateway), use it directly.
+    let targetDeviceId = deviceId;
+    if (cid && this.gatewayDevIds.has(deviceId)) {
+      const subId = this.subDeviceByGwCid.get(`${deviceId}/${cid}`);
+      if (subId) {
+        targetDeviceId = subId;
+      } else {
+        this.log.debug('[TY] MQTT: no sub-device mapped for gw=%s cid=%s, skipping', deviceId, cid);
+        return;
+      }
+    }
+
+    if (!this.discoveredDeviceIds.has(targetDeviceId)) {
+      return;
+    }
+
+    // Each TY MQTT push carries only ONE DP. Merge into the per-device
+    // accumulator so zone state is derived from the full current set, not a
+    // single-DP snapshot (which would zero the run flag and flicker OFF).
+    const merged = this.mqttDpAccumulator.get(targetDeviceId) ?? {};
+    for (const [k, v] of dps) {
+      merged[k] = v;
+    }
+    // When the valve stops (WorkStatus "0"), clear the timer DPs so the zone
+    // reads as off with 0 remaining, not a stale countdown value.
+    if (String(merged['106']) === '0') {
+      delete merged['107']; delete merged['109'];
+    }
+    if (String(merged['153']) === '0') {
+      delete merged['154']; delete merged['156'];
+    }
+    this.mqttDpAccumulator.set(targetDeviceId, merged);
+    const parsedDps = merged;
+
+    const zones: NormalizedZoneStatus[] = [];
+
+    // Map known zone DPs from the accumulated values. The zone-specific DPs
+    // (WorkStatus=106/153, ManualTimer=107/154, ManualSwitch=108/155,
+    // RemainTime=109/156) are the RainPoint TY irrigation schema. Zone 1 uses
+    // the base 106-109 range; zone 2 uses 153-156 (+47 offset).
+    //
+    // Live capture showed DP 107 is the DECREMENTING remaining-minutes timer
+    // (20->19->18...), while 109 (RemainTime) updates less frequently. Use
+    // 107 as the primary remaining-duration source, 109 as fallback.
+    const zoneConfigs = [
+      { port: 1, runDp: 106, timerDp: 107, remainDp: 109 },
+      { port: 2, runDp: 153, timerDp: 154, remainDp: 156 },
+    ];
+
+    for (const zc of zoneConfigs) {
+      const rawRun = parsedDps[String(zc.runDp)];
+      const rawTimer = parsedDps[String(zc.timerDp)];
+      const rawRemain = parsedDps[String(zc.remainDp)];
+      // Only emit a zone if we've seen its run OR timer DP at least once.
+      if (rawRun === undefined && rawTimer === undefined && rawRemain === undefined) {
+        continue;
+      }
+      const isOn = String(rawRun ?? '') === '1';
+      const remainingMin = Number(rawTimer ?? rawRemain ?? 0);
+      zones.push({
+        port: zc.port,
+        name: zc.port === 1 ? 'Zone 1' : 'Zone 2',
+        isOn,
+        remainingDuration: Number.isFinite(remainingMin) && remainingMin > 0
+          ? Math.round(remainingMin * 60) : 0,
+      });
+    }
+
+    const moisture = (parsedDps['9'] ?? parsedDps['14'] ?? parsedDps['humidity'] ?? parsedDps['soil_humidity'] ?? null) as number | null;
+    const temperature = (parsedDps['10'] ?? parsedDps['15'] ?? parsedDps['temperature'] ?? parsedDps['temp_current'] ?? null) as number | null;
+    const battery = (parsedDps['11'] ?? parsedDps['17'] ?? parsedDps['battery_percentage'] ?? parsedDps['residual_electricity'] ?? null) as number | null;
+
+    const status: NormalizedDeviceStatus = {
+      deviceId: targetDeviceId,
+      online: true,
+      zones,
+      moisture,
+      temperature,
+      battery,
+    };
+
+    this.log.info('[TY] MQTT: routed status for gw=%s cid=%s -> sub-device=%s zones=%d (run=%s timer=%s)',
+      deviceId, cid || '-', targetDeviceId, zones.length,
+      zones[0]?.isOn ?? '-', zones[0]?.remainingDuration ?? '-');
+
+    this.deviceStatusMap.set(targetDeviceId, status);
+    this.updateAccessories();
   }
 
   private registerDevice(device: NormalizedDevice): void {
@@ -311,6 +483,11 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
     this.log.info('Starting status polling every %d seconds', intervalSeconds);
 
     this.pollTimer = setInterval(async () => {
+      // Skip polling if MQTT is connected — real-time updates are active
+      if (this.provider === 'ty'
+        && (this.client as RainPointTyClient).getMqttConnected()) {
+        return;
+      }
       await this.pollStatus();
     }, intervalSeconds * 1000);
 

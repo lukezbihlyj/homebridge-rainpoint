@@ -43,6 +43,7 @@
     "homekit"
   ],
   "dependencies": {
+    "mqtt": "^5.15.1",
     "uuid": "^14.0.0"
   },
   "devDependencies": {

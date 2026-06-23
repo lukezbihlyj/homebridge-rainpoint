@@ -31,6 +31,13 @@ export interface NormalizedDevice {
   parentId?: string;
   addr: number;
   /**
+   * Mesh node id for TY sub-devices (from deviceTopo.nodeId). Real-time DP
+   * pushes arrive on the GATEWAY's MQTT topic `smart/mb/in/{gwId}` and
+   * identify the sub-device via the `cid` field, which equals this nodeId.
+   * Used to route MQTT DP updates to the correct sub-device accessory.
+   */
+  nodeId?: string;
+  /**
    * Per-zone switch (valve on/off) datapoint IDs. Index 0 = zone 1's switch DP,
    * index 1 = zone 2's, etc. The Tuya/RainPoint TY device exposes each valve as
    * a distinct DP (e.g. 104 for zone 1, 155 for zone 2 on a split controller).

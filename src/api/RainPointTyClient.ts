@@ -2,6 +2,7 @@ import https from 'https';
 import crypto from 'crypto';
 import { URL } from 'url';
 import { v4 as uuidv4 } from 'uuid';
+import mqtt from 'mqtt';
 
 import {
   RainPointClient,
@@ -80,8 +81,89 @@ const REGION_ENDPOINTS: Record<string, string> = {
   US: 'https://a1-us.baldrgroup.net/api.json',
 };
 
+// MQTT broker hostnames per region (mobileMqttsUrl from encrypted regions file).
+// RainPoint TY uses private-label Tuya brokers at *.baldrgroup.net.
+const MQTT_BROKERS: Record<string, string> = {
+  EU: 'm1-eu.baldrgroup.net',
+  AZ: 'm1-us.baldrgroup.net',
+  IN: 'm1-in.baldrgroup.net',
+  US: 'm1-us.baldrgroup.net',
+};
+const MQTT_PORT = 8883;
+
+// The MQTT broker port may come from the login response domain.mqttsPort;
+// fall back to this default.
+const DEFAULT_MQTT_PORT = 8883;
+
+// Hardcoded salt used in the MQTT clientId construction (from bqbppdq.smali).
+const MQTT_CLIENTID_SALT = 'sdkfasodifca';
+const MQTT_CLIENTID_TAG = 'DEFAULT';
+
 function md5(data: string): string {
   return crypto.createHash('md5').update(data, 'utf8').digest('hex');
+}
+
+// MD5 of the HMAC_KEY — used as the key for the MQTT password derivation.
+// doCommandNative(cmd=2, ecode) = MD5( md5_hex(HMAC_KEY) + ecode ).
+// Verified against 26 Frida-captured test vectors. See reverse-engineering/
+// docs in the homebridge-re-tools repo for the full derivation.
+const MD5_HEX_HMAC_KEY = md5(HMAC_KEY);
+
+/**
+ * Derive the MQTT password for RainPoint TY's SdkMqttCertificationInfo auth.
+ *
+ * The app calls ThingNetworkSecurity.doCommandNative(app, 2, ecode.getBytes(),
+ * null, mD) which computes MD5( md5_hex(HMAC_KEY) + ecode ), then takes the
+ * 16 chars from the middle: raw.substring(len/2 - 8, len/2 + 8).
+ *
+ * For a 32-char hex string (MD5 output), mid=16, so substring(8, 24).
+ *
+ * Reversed from libthing_security.so via Frida — see the re-tools docs.
+ */
+function deriveMqttPassword(ecode: string): string {
+  const raw = md5(MD5_HEX_HMAC_KEY + ecode);
+  // raw is 32 chars; password = raw.substring(8, 24) (16 chars from the middle)
+  return raw.substring(8, 24);
+}
+
+/**
+ * Derive the MQTT username for SdkMqttCertificationInfo auth.
+ *
+ * Format (from qpqbppd.smali / SdkMqttCertificationInfo.qddqppb):
+ *   {partnerIdentity}_v1_{appId}_{chKey}_mb_{sid}{last16(md5(md5(appId)+ecode))}
+ *
+ * - partnerIdentity: from the login response (e.g. "p1306631")
+ * - appId: ThingSmartNetWork.mAppId (= APP_KEY)
+ * - chKey: ThingNetworkSecurity.getChKey(app, appId.getBytes()) = CH_KEY
+ * - sid: from the login response
+ * - last16: md5(md5(appId) + ecode).substring(16, 32) (last 16 chars of 32-char MD5 hex)
+ */
+function deriveMqttUsername(
+  partnerIdentity: string,
+  appId: string,
+  chKey: string,
+  sid: string,
+  ecode: string,
+): string {
+  const md5AppId = md5(appId);
+  const last16 = md5(md5AppId + ecode).substring(16, 32);
+  return `${partnerIdentity}_v1_${appId}_${chKey}_mb_${sid}${last16}`;
+}
+
+/**
+ * Derive the MQTT clientId for SdkMqttCertificationInfo auth.
+ *
+ * Format (from bqbppdq.smali / MqttServerManager.initMqttConfig):
+ *   {packageName}_mb_{deviceId}_{md5(uid + "sdkfasodifca")}_{tag}
+ *
+ * - packageName: "com.baldr.rainpoint"
+ * - deviceId: the same per-install device UUID used for API requests
+ * - uid: from the login response
+ * - "sdkfasodifca": hardcoded salt (bqbppdq.smali:1483)
+ * - tag: "DEFAULT" (pdqdqbd.smali:380)
+ */
+function deriveMqttClientId(packageName: string, deviceId: string, uid: string): string {
+  return `${packageName}_mb_${deviceId}_${md5(uid + MQTT_CLIENTID_SALT)}_${MQTT_CLIENTID_TAG}`;
 }
 
 function mobileHash(data: string): string {
@@ -197,15 +279,34 @@ interface TuyaLoginResult {
   uid: string;
   ecode: string;
   timezone: string;
-  expire_time: number;
-  access_token: string;
-  refresh_token: string;
-  terminal_id: string;
+  expire_time?: number;
   homeId?: string;
+  // RainPoint TY private cloud login response. Unlike the standard Tuya login,
+  // this cloud does NOT return access_token/refresh_token — MQTT auth derives
+  // credentials from sid+ecode+uid+partnerIdentity instead (see
+  // deriveMqttPassword/deriveMqttUsername). The domain block carries the MQTT
+  // broker hostname (mobileMqttsUrl) and port (mqttsPort).
   domain?: {
     mobileApiUrl?: string;
     regionCode?: string;
+    mobileMqttsUrl?: string;
+    mqttsPort?: number;
+    mobileMqttUrl?: string;
+    mqttPort?: number;
+    [key: string]: unknown;
   };
+  // partnerIdentity is a string (e.g. "p1306631") — the OEM identity used in
+  // the MQTT username and subscription topic ({partnerIdentity}/mb/{uid}).
+  partnerIdentity?: string;
+  extras?: Record<string, unknown>;
+  username?: string;
+  nickname?: string;
+  email?: string;
+  userType?: number;
+  accountType?: number;
+  phoneCode?: string;
+  mobile?: string;
+  [key: string]: unknown;
 }
 
 interface TuyaTokenResult {
@@ -251,6 +352,12 @@ interface TuyaDevice {
   };
   isSubDevice?: boolean;
   sub?: boolean;
+  // Per-device AES key (16 chars). The gateway's localKey decrypts MQTT DP
+  // pushes that arrive on smart/mb/in/{gwId} (Tuya "Thing" protocol 2.2
+  // binary frame, AES-128-ECB/PKCS5). Sub-devices typically share the
+  // gateway's localKey for cloud-pushed DPs.
+  localKey?: string;
+  local_key?: string;
 }
 
 interface TuyaDpResult {
@@ -300,23 +407,45 @@ class TuyaApiError extends Error {
 export class RainPointTyClient implements RainPointClient {
   private sid: string = '';
   private ecode: string = '';
+  private uid: string = '';
+  private partnerIdentity: string = '';
+  private mqttBroker: string = '';
+  private mqttPort: number = DEFAULT_MQTT_PORT;
   private endpoint: string;
   private deviceId: string;
   private readonly countryCode: string;
+  private readonly region: string;
   private homeId: string = '';
   private static deviceIdStorage: string | null = null;
   // Cache of deviceId -> NormalizedDevice, populated by getDevices(). Used by
   // turnZoneOn/Off to resolve a 1-based port number to the device's per-zone
   // switch DP (RainPoint TY uses 104/155/... rather than DP 1/2/...).
   private deviceCache: Map<string, NormalizedDevice> = new Map();
+  // Map of devId -> localKey for EVERY device returned by the device list
+  // (gateways AND sub-devices). Used to AES-decrypt MQTT DP pushes that
+  // arrive on `smart/mb/in/{devId}` as Tuya "Thing" protocol 2.2 binary
+  // frames. The gateway's localKey decrypts pushes for its sub-devices.
+  private localKeys: Map<string, string> = new Map();
   private readonly sessionFile: string | null;
   private sessionRestored = false;
+
+  // MQTT push for real-time DP updates (replaces polling).
+  private mqttClient: mqtt.MqttClient | null = null;
+  private mqttConnected = false;
+  // Callback set by platform to receive DP status updates outside poll cycle.
+  private onStatusUpdate: ((deviceId: string, dps: Map<string, unknown>, cid?: string) => void) | null = null;
+  // Callback for MQTT connect/disconnect events — platform uses this to
+  // start/stop polling dynamically.
+  private onMqttConnect: ((connected: boolean) => void) | null = null;
+  // MQTT reconnect timer handle
+  private mqttReconnectTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private config: RainPointClientConfig,
     private log: Logger,
   ) {
     const region = config.region || 'EU';
+    this.region = region;
     this.endpoint = REGION_ENDPOINTS[region] || REGION_ENDPOINTS.EU!;
     // countryCode defaults to "1" (US/Canada). The Tuya/Thingclips account is keyed by
     // countryCode + email — a wrong countryCode yields USER_PASSWD_WRONG because the
@@ -336,7 +465,7 @@ export class RainPointTyClient implements RainPointClient {
     }
   }
 
-  /** Load a saved session (sid/ecode/endpoint) from disk, if present. */
+  /** Load a saved session from disk, if present. */
   private loadSession(): void {
     if (!this.sessionFile) {
       return;
@@ -347,10 +476,18 @@ export class RainPointTyClient implements RainPointClient {
         return;
       }
       const raw = fs.readFileSync(this.sessionFile, 'utf8');
-      const saved = JSON.parse(raw) as { sid?: string; ecode?: string; endpoint?: string };
+      const saved = JSON.parse(raw) as {
+        sid?: string; ecode?: string; endpoint?: string;
+        uid?: string; partnerIdentity?: string;
+        mqttBroker?: string; mqttPort?: number;
+      };
       if (saved.sid) {
         this.sid = saved.sid;
         this.ecode = saved.ecode || '';
+        this.uid = saved.uid || '';
+        this.partnerIdentity = saved.partnerIdentity || '';
+        this.mqttBroker = saved.mqttBroker || '';
+        this.mqttPort = saved.mqttPort || DEFAULT_MQTT_PORT;
         if (saved.endpoint) {
           this.endpoint = saved.endpoint;
         }
@@ -363,7 +500,7 @@ export class RainPointTyClient implements RainPointClient {
     }
   }
 
-  /** Persist the current session (sid/ecode/endpoint) to disk. */
+  /** Persist the current session to disk. */
   private saveSession(): void {
     if (!this.sessionFile) {
       return;
@@ -374,6 +511,10 @@ export class RainPointTyClient implements RainPointClient {
         sid: this.sid,
         ecode: this.ecode,
         endpoint: this.endpoint,
+        uid: this.uid,
+        partnerIdentity: this.partnerIdentity,
+        mqttBroker: this.mqttBroker,
+        mqttPort: this.mqttPort,
       });
       fs.writeFileSync(this.sessionFile, data, 'utf8');
       this.log.debug('[TY] Saved session to %s', this.sessionFile);
@@ -386,7 +527,11 @@ export class RainPointTyClient implements RainPointClient {
   private clearSession(): void {
     this.sid = '';
     this.ecode = '';
+    this.uid = '';
+    this.partnerIdentity = '';
+    this.mqttBroker = '';
     this.sessionRestored = false;
+    this.disconnectMqtt();
     if (!this.sessionFile) {
       return;
     }
@@ -578,6 +723,16 @@ export class RainPointTyClient implements RainPointClient {
   private handleLoginResult(result: TuyaLoginResult): void {
     this.sid = result.sid;
     this.ecode = result.ecode;
+    this.uid = result.uid;
+    // partnerIdentity is a string (e.g. "p1306631") used in MQTT auth.
+    this.partnerIdentity = typeof result.partnerIdentity === 'string' ? result.partnerIdentity : '';
+    // MQTT broker info comes from the login response domain block.
+    if (result.domain?.mobileMqttsUrl) {
+      this.mqttBroker = result.domain.mobileMqttsUrl;
+    }
+    if (result.domain?.mqttsPort) {
+      this.mqttPort = result.domain.mqttsPort;
+    }
     if (result.domain?.mobileApiUrl) {
       const newEndpoint = result.domain.mobileApiUrl + '/api.json';
       if (newEndpoint !== this.endpoint) {
@@ -588,6 +743,10 @@ export class RainPointTyClient implements RainPointClient {
     this.sessionRestored = false;
     this.saveSession();
     this.log.info('Logged in to RainPoint TY API as %s', this.config.email);
+    if (this.partnerIdentity) {
+      this.log.info('[TY] partnerIdentity=%s, mqttBroker=%s:%d',
+        this.partnerIdentity, this.mqttBroker, this.mqttPort);
+    }
   }
 
   async ensureAuthenticated(): Promise<void> {
@@ -640,6 +799,15 @@ export class RainPointTyClient implements RainPointClient {
 
     const devices: NormalizedDevice[] = [];
     for (const device of result) {
+      // Capture every device's localKey (gateways AND sub-devices) for
+      // decrypting MQTT DP pushes. The gateway is skipped as an accessory
+      // below, but its localKey is required to decrypt pushes that arrive
+      // on smart/mb/in/{gwId} for its sub-devices.
+      const lk = device.localKey || device.local_key;
+      if (lk) {
+        this.localKeys.set(device.devId, lk);
+      }
+
       // TY sub-devices are individual zones (each deviceTopo.parentDevId sub-device
       // is one irrigation zone). The gateway has no parent. So each non-gateway
       // device is a single-port valve.
@@ -673,6 +841,9 @@ export class RainPointTyClient implements RainPointClient {
         isSubDevice,
         parentId: device.deviceTopo?.parentDevId || device.parent_id || undefined,
         addr: 0,
+        // Mesh node id — the `cid` field in MQTT DP pushes on the gateway's
+        // topic identifies which sub-device the update is for.
+        nodeId: device.deviceTopo?.nodeId,
         zoneSwitchDps,
       });
     }
@@ -847,6 +1018,360 @@ export class RainPointTyClient implements RainPointClient {
     requireSid: boolean | string = true,
   ): Promise<T> {
     return this.request<T>(action, data, requireSid);
+  }
+
+  // --------------------------------------------------------------------------
+  // MQTT push — real-time DP updates from Tuya cloud broker.
+  //
+  // The RainPoint TY app uses MQTT-over-TLS (port 8883) to receive instant DP
+  // changes. The SDK (SdkMqttCertificationInfo, obfuscated class qpqbppd)
+  // derives credentials entirely from the login response — no access_token:
+  //
+  //   username  = {partnerIdentity}_v1_{appId}_{chKey}_mb_{sid}{last16(md5(md5(appId)+ecode))}
+  //   password  = doCommandNative(2, ecode).substring(8, 24)
+  //             = MD5( md5_hex(HMAC_KEY) + ecode ).substring(8, 24)
+  //   clientId  = {packageName}_mb_{deviceId}_{md5(uid + "sdkfasodifca")}_DEFAULT
+  //   topic     = {partnerIdentity}/mb/{uid}   (single subscription — all devices)
+  //   broker    = ssl://{domain.mobileMqttsUrl}:{domain.mqttsPort}
+  //
+  // The doCommandNative(cmd=2) algorithm was reversed from libthing_security.so
+  // via Frida on an arm64 Android emulator. See the reverse-engineering docs in
+  // the homebridge-re-tools repo for the full derivation.
+  // --------------------------------------------------------------------------
+
+  /**
+   * Register a callback for real-time DP status updates received via MQTT.
+   * Called by the platform layer once, after device discovery.
+   */
+  setOnStatusUpdate(cb: (deviceId: string, dps: Map<string, unknown>, cid?: string) => void): void {
+    this.onStatusUpdate = cb;
+  }
+
+  /**
+   * Register a callback for MQTT connection state changes. The platform uses
+   * this to stop polling when MQTT is connected and restart it on disconnect.
+   */
+  setOnMqttConnect(cb: (connected: boolean) => void): void {
+    this.onMqttConnect = cb;
+  }
+
+  /**
+   * Connect to the Tuya MQTT broker using SdkMqttCertificationInfo credentials
+   * derived from the login session (sid, ecode, uid, partnerIdentity).
+   * Subscribes to the single user topic {partnerIdentity}/mb/{uid} — all
+   * device DP updates arrive on this topic.
+   */
+  /**
+   * Connect to the Tuya MQTT broker. Subscribes to:
+   *   - `{partnerIdentity}/mb/{uid}` — user-level topic (home/family events).
+   *   - `smart/mb/in/{devId}` — PER-DEVICE topic. This is where real-time DP
+   *     pushes actually arrive (verified from the decompiled app:
+   *     com.thingclips.sdk.device.pbpqqdp:2301 and
+   *     com.thingclips.sdk.bluetooth.dpppbbd:554 subscribe to
+   *     "smart/mb/in/" + devId for each device). The user topic does NOT
+   *     receive DP pushes — subscribing only to it yields zero PUBLISH
+   *     packets even though SUBACK grants QoS 1. The broker's ACL rejects
+   *     wildcard filters (`#`, `smart/mb/#`) with granted=128, so we must
+   *     subscribe to each device topic individually.
+   */
+  async connectMqtt(deviceIds: string[] = []): Promise<void> {
+    if (!this.sid || !this.ecode || !this.uid || !this.partnerIdentity) {
+      this.log.warn('[TY] MQTT: session incomplete (sid/ecode/uid/partnerIdentity), skipping');
+      return;
+    }
+    if (this.mqttClient) {
+      return; // already connected or connecting
+    }
+
+    const brokerHost = this.mqttBroker || MQTT_BROKERS[this.region] || MQTT_BROKERS.AZ!;
+    const brokerPort = this.mqttPort || MQTT_PORT;
+    const url = `tls://${brokerHost}:${brokerPort}`;
+
+    const username = deriveMqttUsername(
+      this.partnerIdentity, APP_KEY, CH_KEY, this.sid, this.ecode,
+    );
+    const password = deriveMqttPassword(this.ecode);
+    const clientId = deriveMqttClientId(PACKAGE_NAME, this.deviceId, this.uid);
+    const userTopic = `${this.partnerIdentity}/mb/${this.uid}`;
+    // Per-device DP push topics — the actual destination for real-time
+    // device state changes. One topic per device, no wildcards (ACL blocks them).
+    const deviceTopics = deviceIds.map(id => `smart/mb/in/${id}`);
+
+    this.log.info('[TY] MQTT: connecting to %s (clientId=%s..., userTopic=%s, deviceTopics=%d)',
+      url, clientId.slice(0, 24), userTopic, deviceTopics.length);
+
+    // Last Will & Testament (LWT). The Tuya SDK registers a will on the
+    // CONNECT packet (MqttModel.smali:3036) — the broker uses this as a
+    // presence/registration marker: without it, the broker accepts the
+    // connection + subscription (CONNACK returnCode=0, SUBACK granted=0)
+    // but does NOT route DP pushes to the client. The will payload is a
+    // fixed JSON shape:
+    //   {"clientId":"<clientId>","deviceType":"ANDROID","message":"","userName":"<username>"}
+    // published to the static topic "tuya/smart/will" (pqpbpqd.dpdbqdp,
+    // computed as "thing/smart/will".replace("hing","uya")) at QoS 1,
+    // retain=false. We use "homebridge" as deviceType since we aren't the
+    // Android app — the broker doesn't validate this field, only its
+    // presence in the CONNECT packet.
+    const willTopic = 'tuya/smart/will';
+    const willPayload = JSON.stringify({
+      clientId,
+      deviceType: 'ANDROID',
+      message: '',
+      username,
+    });
+
+    try {
+      this.mqttClient = mqtt.connect(url, {
+        clientId,
+        username,
+        password,
+        clean: true,
+        reconnectPeriod: 15000,
+        connectTimeout: 30000,
+        rejectUnauthorized: false,
+        // Tuya broker requires a will in the CONNECT packet to route DP
+        // pushes — see note above. QoS 1, retain false, matches the app.
+        will: {
+          topic: willTopic,
+          payload: willPayload,
+          qos: 1,
+          retain: false,
+        },
+      });
+
+      this.mqttClient.on('connect', () => {
+        this.mqttConnected = true;
+        this.log.info('[TY] MQTT: connected to %s', brokerHost);
+        // Subscribe to the user topic + one per-device topic for each
+        // discovered device. The broker's ACL rejects wildcard filters
+        // (`#`, `smart/mb/#`) with granted=128 (0x80), which mqtt.js treats
+        // as a subscribe failure — so we subscribe only to exact topic
+        // names. All entries here are exact (no wildcards), so SUBACK
+        // returns granted=1 for each and delivery works.
+        const topics = [userTopic, ...deviceTopics];
+        this.mqttClient!.subscribe(topics, { qos: 1 }, (err, granted) => {
+          if (err) {
+            this.log.warn('[TY] MQTT: subscribe failed: %s', err);
+          } else {
+            this.log.info('[TY] MQTT: subscribed to %d topic(s)', topics.length);
+            if (granted) {
+              for (const g of granted) {
+                this.log.info('[TY] MQTT: granted qos=%d for %s', g.qos, g.topic);
+              }
+            }
+          }
+        });
+        // Notify platform so it can stop polling (MQTT is the source of truth)
+        if (this.onMqttConnect) {
+          this.onMqttConnect(true);
+        }
+      });
+
+      this.mqttClient.on('message', (topic: string, payload: Buffer) => {
+        this.log.info('[TY] MQTT: message on topic=%s (%d bytes)', topic, payload.length);
+        this.handleMqttPayload(payload, topic);
+      });
+
+      this.mqttClient.on('close', () => {
+        this.mqttConnected = false;
+        this.log.info('[TY] MQTT: disconnected — falling back to polling');
+        // Notify platform to restart polling
+        if (this.onMqttConnect) {
+          this.onMqttConnect(false);
+        }
+      });
+
+      this.mqttClient.on('error', (err) => {
+        this.log.warn('[TY] MQTT: error: %s', err.message);
+      });
+
+      // Protocol-level debug: log every MQTT packet sent/received so we can
+      // see the exact CONNECT/CONNACK/SUBSCRIBE/SUBACK/PUBLISH flow when
+      // diagnosing connection or message issues.
+      this.mqttClient.on('packetsend', (packet) => {
+        const p = packet as { cmd: string };
+        const s = JSON.stringify(packet);
+        this.log.info('[TY] MQTT >> %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
+      });
+      this.mqttClient.on('packetreceive', (packet) => {
+        const p = packet as { cmd: string };
+        const s = JSON.stringify(packet);
+        this.log.info('[TY] MQTT << %s: %s', p.cmd, s.length > 300 ? s.substring(0, 300) + '...' : s);
+      });
+    } catch (e) {
+      this.log.warn('[TY] MQTT: connection failed: %s', e);
+    }
+  }
+
+  /**
+   * Handle an incoming MQTT payload. Two formats are possible:
+   *
+   *  1. Plaintext JSON — starts with '{'. Some user-topic messages and the
+   *     `tylink/` protocol use raw JSON. Parsed directly.
+   *
+   *  2. Tuya "Thing" protocol 2.2 binary frame — starts with the ASCII
+   *     version tag "2.2" (bytes 0x32 0x2E 0x32). This is the format real-time
+   *     DP pushes arrive in on `smart/mb/in/{devId}`. Frame layout (from the
+   *     decompiled app, com.thingclips.sdk.mqtt.qbpppdb / MsgProtocol2_2):
+   *
+   *       [0:3]   = "2.2"               (protocol version, ASCII)
+   *       [3:7]   = CRC32 of [7:end]    (little-endian int32)
+   *       [7:11]  = sequence number     (int32)
+   *       [11:15] = origin              (int32)
+   *       [15:end]= AES-128-ECB/PKCS5-encrypted JSON, key = device localKey
+   *
+   *     The decrypted JSON has fields: `protocol`, `pv`, `gwId`, `t`, `data`
+   *     (and sometimes `sign`). `data` holds the dps. We resolve the localKey
+   *     from the topic's devId via the device-list cache (gateway localKey
+   *     decrypts pushes for its sub-devices).
+   */
+  private handleMqttPayload(payload: Buffer, topic?: string): void {
+    const prefix = payload.subarray(0, 3).toString('latin1');
+    let msg: Record<string, unknown>;
+
+    if (prefix === '2.2' || prefix === '2.3' || prefix === '2.1' || prefix === '1.1') {
+      // Tuya Thing binary frame — decrypt with the topic device's localKey.
+      this.log.info('[TY] MQTT: received %s binary frame on %s (%d bytes)',
+        prefix, topic || '?', payload.length);
+      try {
+        msg = this.parseTuyaBinaryFrame(payload, topic);
+        this.log.info('[TY] MQTT: %s frame decrypted: %s',
+          prefix, JSON.stringify(msg).length > 300
+            ? JSON.stringify(msg).substring(0, 300) + '...' : JSON.stringify(msg));
+      } catch (e) {
+        this.log.warn('[TY] MQTT: failed to decode %s frame on %s: %s',
+          prefix, topic || '?', e);
+        return;
+      }
+    } else {
+      // Plaintext JSON (user topic, tylink/, etc.)
+      const payloadStr = payload.toString('utf8');
+      this.log.info('[TY] MQTT: received message on %s (%d bytes): %s',
+        topic || '?', payload.length,
+        payloadStr.length > 200 ? payloadStr.substring(0, 200) + '...' : payloadStr);
+      try {
+        msg = JSON.parse(payloadStr);
+      } catch {
+        this.log.warn('[TY] MQTT: unparseable non-JSON, non-binary payload on %s', topic || '?');
+        return;
+      }
+    }
+
+    this.handleMqttMessage(msg, topic);
+  }
+
+  /**
+   * Parse a Tuya "Thing" protocol binary frame (version 2.2/2.3/2.1/1.1).
+   * Decrypts the AES-128-ECB/PKCS5 encrypted body with the topic device's
+   * localKey and returns the inner JSON object. CRC verification is skipped
+   * (some pushes have a different CRC scheme; decryption success is the
+   * real validity check).
+   */
+  private parseTuyaBinaryFrame(payload: Buffer, topic?: string): Record<string, unknown> {
+    // The topic is `smart/mb/in/{devId}` (or a user/wildcard topic). The
+    // devId is the segment after the last '/'. The localKey for that devId
+    // decrypts the frame. For sub-device pushes, the devId is the GATEWAY
+    // and the gateway's localKey is used.
+    let devId: string | undefined;
+    if (topic) {
+      const lastSlash = topic.lastIndexOf('/');
+      if (lastSlash >= 0 && lastSlash < topic.length - 1) {
+        devId = topic.substring(lastSlash + 1);
+      }
+    }
+    const localKey = devId ? this.localKeys.get(devId) : undefined;
+    if (!localKey) {
+      throw new Error(`no localKey for devId ${devId} (have ${this.localKeys.size} keys: ${Array.from(this.localKeys.keys()).map(k => k.slice(0,10)).join(',')})`);
+    }
+    if (payload.length < 15) {
+      throw new Error(`frame too short (${payload.length} bytes)`);
+    }
+    // Encrypted body = bytes [15:end].
+    const ct = payload.subarray(15);
+    const key = Buffer.from(localKey, 'utf8');
+    const decipher = crypto.createDecipheriv('aes-128-ecb', key, null);
+    decipher.setAutoPadding(true);
+    const pt = Buffer.concat([decipher.update(ct), decipher.final()]);
+    return JSON.parse(pt.toString('utf8'));
+  }
+
+  /**
+   * Handle a parsed MQTT message. Expected format (Tuya DP push):
+   * {
+   *   "t": 1718500000,
+   *   "data": { "dps": { "106": "1", ... }, "dpsTime": {...} },
+   *   "deviceId": "<device_id>",
+   *   "gwId": "<gateway_id>",
+   *   "protocol": 4,
+   *   "type": "dp"
+   * }
+   */
+  private handleMqttMessage(msg: Record<string, unknown>, topic?: string): void {
+    // deviceId may be in the payload (msg.deviceId) OR derivable from the
+    // topic. Per-device DP pushes arrive on `smart/mb/in/{devId}` — the
+    // payload may or may not echo the deviceId, so fall back to the topic
+    // suffix (the segment after the last '/'), matching the app's
+    // topic2devId() helper (com.thingclips.sdk.mqtt.bqbppdq:5496).
+    let deviceId = msg.deviceId as string | undefined;
+    if (!deviceId && topic) {
+      const lastSlash = topic.lastIndexOf('/');
+      if (lastSlash >= 0 && lastSlash < topic.length - 1) {
+        deviceId = topic.substring(lastSlash + 1);
+      }
+    }
+    const data = msg.data as Record<string, unknown> | undefined;
+    const protocol = msg.protocol as number;
+    const msgType = msg.type as string;
+
+    this.log.info('[TY] MQTT: parsed msg: deviceId=%s protocol=%s type=%s',
+      deviceId || '(none)', protocol, msgType || '(none)');
+
+    if (!deviceId || !data) {
+      this.log.info('[TY] MQTT: skipping msg without deviceId/data');
+      return;
+    }
+
+    // Only handle DP data changes (protocol=4 or type="dp").
+    if (protocol !== 4 && msgType !== 'dp') {
+      this.log.info('[TY] MQTT: skipping non-DP msg (protocol=%s type=%s)', protocol, msgType);
+      return;
+    }
+
+    const dps = data.dps as Record<string, unknown> | undefined;
+    if (!dps) {
+      this.log.info('[TY] MQTT: msg has no dps field, data keys: %s', Object.keys(data).join(','));
+      return;
+    }
+
+    // cid identifies the sub-device (mesh node) within a gateway push. The
+    // topic devId is the GATEWAY; cid maps to the sub-device's nodeId.
+    const cid = typeof data.cid === 'string' ? data.cid : undefined;
+
+    this.log.info('[TY] MQTT: DP update for %s (cid=%s): %s',
+      deviceId, cid || '-', JSON.stringify(dps));
+
+    // Forward the parsed DPs to the platform callback.
+    if (this.onStatusUpdate) {
+      const dpsMap = new Map(Object.entries(dps));
+      this.onStatusUpdate(deviceId, dpsMap, cid);
+    }
+  }
+
+  /** Disconnect MQTT and clean up. */
+  disconnectMqtt(): void {
+    if (this.mqttReconnectTimer) {
+      clearTimeout(this.mqttReconnectTimer);
+      this.mqttReconnectTimer = null;
+    }
+    if (this.mqttClient) {
+      this.mqttClient.end(true);
+      this.mqttClient = null;
+    }
+    this.mqttConnected = false;
+  }
+
+  getMqttConnected(): boolean {
+    return this.mqttConnected;
   }
 
   async getDeviceStatuses(deviceIds: string[]): Promise<Map<string, NormalizedDeviceStatus>> {
