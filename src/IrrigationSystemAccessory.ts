@@ -1,5 +1,7 @@
 import { Service, PlatformAccessory, CharacteristicValue } from 'homebridge';
 
+const DEFAULT_DURATION_SEC = 1200;
+
 import { RainPointPlatform, DeviceAccessoryContext } from './platform';
 import { NormalizedDevice, NormalizedDeviceStatus } from './api/RainPointClientInterface';
 import { ValveAccessory } from './ValveAccessory';
@@ -9,6 +11,7 @@ export class IrrigationSystemAccessory {
   private systemService: Service;
   private valveAccessories: ValveAccessory[] = [];
   private isOnline: boolean = false;
+  private readonly valveSetDurations: Map<number, number> = new Map();
 
   constructor(
     private readonly platform: RainPointPlatform,
@@ -190,10 +193,26 @@ export class IrrigationSystemAccessory {
     );
 
     try {
+      const valveService = this.accessory.services.find(
+        s => s.subtype === `zone${port}` && s.UUID === this.platform.Service.Valve.UUID,
+      );
+      const Characteristic = this.platform.Characteristic;
+
       if (targetActive === this.platform.Characteristic.Active.ACTIVE) {
-        await this.platform.client.turnZoneOn(this.context.deviceId, port);
+        const duration = this.valveSetDurations.get(port) ?? DEFAULT_DURATION_SEC;
+        await this.platform.client.turnZoneOn(this.context.deviceId, port, duration);
+
+        // Optimistic update: immediately reflect ON + remaining duration so the
+        // Home app doesn't show a stale state / "Waiting" before MQTT confirms.
+        valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.ACTIVE);
+        valveService?.updateCharacteristic(Characteristic.InUse, Characteristic.InUse.IN_USE);
+        valveService?.updateCharacteristic(Characteristic.RemainingDuration, duration);
       } else {
         await this.platform.client.turnZoneOff(this.context.deviceId, port);
+
+        valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.INACTIVE);
+        valveService?.updateCharacteristic(Characteristic.InUse, Characteristic.InUse.NOT_IN_USE);
+        valveService?.updateCharacteristic(Characteristic.RemainingDuration, 0);
       }
     } catch (error) {
       this.platform.log.error('Failed to control valve: %s', error);
@@ -209,12 +228,15 @@ export class IrrigationSystemAccessory {
       : this.platform.Characteristic.InUse.NOT_IN_USE;
   }
 
-  private async getValveSetDuration(_port: number): Promise<CharacteristicValue> {
-    return 600;
+  private async getValveSetDuration(port: number): Promise<CharacteristicValue> {
+    return this.valveSetDurations.get(port) ?? DEFAULT_DURATION_SEC;
   }
 
   private async setValveSetDuration(port: number, value: CharacteristicValue): Promise<void> {
-    this.platform.log.debug('[%s] Set duration for zone %d to %d seconds', this.device.name, port, value);
+    const duration = value as number;
+    this.valveSetDurations.set(port, duration);
+    this.platform.log.debug('[%s] Set duration for zone %d to %d seconds (%d minutes)',
+      this.device.name, port, duration, Math.floor(duration / 60));
   }
 
   private async getValveRemainingDuration(port: number): Promise<CharacteristicValue> {

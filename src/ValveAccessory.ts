@@ -9,7 +9,7 @@ export class ValveAccessory {
   private isOn: boolean = false;
   private isOnline: boolean = false;
   private remainingDuration: number = 0;
-  private setDuration: number = 600;
+  private setDuration: number = 1200;
 
   private lastCommandTime = 0;
   private readonly COMMAND_DEBOUNCE_MS = 5000;
@@ -76,12 +76,6 @@ export class ValveAccessory {
   }
 
   updateStatus(status: NormalizedDeviceStatus): void {
-    const timeSinceLastCommand = Date.now() - this.lastCommandTime;
-    if (timeSinceLastCommand < this.COMMAND_DEBOUNCE_MS) {
-      this.platform.log.debug('[%s] Ignoring update during debounce', this.context.portName);
-      return;
-    }
-
     this.isOnline = status.online;
 
     const zone = status.zones.find(z => z.port === this.context.port);
@@ -126,8 +120,6 @@ export class ValveAccessory {
     );
 
     try {
-      this.lastCommandTime = Date.now();
-
       if (targetActive === this.platform.Characteristic.Active.ACTIVE) {
         await this.platform.client.turnZoneOn(
           this.context.deviceId,
@@ -136,6 +128,22 @@ export class ValveAccessory {
         );
         this.isOn = true;
         this.remainingDuration = this.setDuration;
+
+        // Optimistic update: immediately reflect ON + remaining duration so
+        // the Home app doesn't show stale state / "Waiting" before the next
+        // poll/MQTT push confirms the change.
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.Active,
+          this.platform.Characteristic.Active.ACTIVE,
+        );
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.InUse,
+          this.platform.Characteristic.InUse.IN_USE,
+        );
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.RemainingDuration,
+          this.remainingDuration,
+        );
       } else {
         await this.platform.client.turnZoneOff(
           this.context.deviceId,
@@ -143,6 +151,19 @@ export class ValveAccessory {
         );
         this.isOn = false;
         this.remainingDuration = 0;
+
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.Active,
+          this.platform.Characteristic.Active.INACTIVE,
+        );
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.InUse,
+          this.platform.Characteristic.InUse.NOT_IN_USE,
+        );
+        this.service.updateCharacteristic(
+          this.platform.Characteristic.RemainingDuration,
+          0,
+        );
       }
     } catch (error) {
       this.platform.log.error('Failed to set valve: %s', error);
