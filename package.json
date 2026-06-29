@@ -1,6 +1,6 @@
 {
   "name": "homebridge-rainpoint",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "displayName": "Homebridge RainPoint",
   "description": "Homebridge plugin for RainPoint irrigation systems - control water timers, valves, and soil sensors via the RainPoint/HomGar cloud API.",
   "author": "Luke Zbihlyj",

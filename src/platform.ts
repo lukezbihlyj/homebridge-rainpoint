@@ -277,6 +277,14 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       return;
     }
 
+    // Resolve the target device's resolved zone DP schema (from
+    // thing.m.product.thing.model) so we can map DPs to zones generically
+    // instead of hardcoding the 106/153 zone-1/zone-2 ranges. The schema is
+    // authoritative for per-zone WorkStatus/ManualTimer/ManualSwitch/RemainTime
+    // DP ids and supports any zone count + offset.
+    const targetDevice = this.normalizedDevices.get(targetDeviceId);
+    const targetZoneDps = targetDevice?.zoneDps;
+
     // Each TY MQTT push carries only ONE DP. Merge into the per-device
     // accumulator so zone state is derived from the full current set, not a
     // single-DP snapshot (which would zero the run flag and flicker OFF).
@@ -284,31 +292,50 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
     for (const [k, v] of dps) {
       merged[k] = v;
     }
-    // When the valve stops (WorkStatus "0"), clear the timer DPs so the zone
-    // reads as off with 0 remaining, not a stale countdown value.
-    if (String(merged['106']) === '0') {
-      delete merged['107']; delete merged['109'];
-    }
-    if (String(merged['153']) === '0') {
-      delete merged['154']; delete merged['156'];
+    // When a zone's WorkStatus reads "0" (stopped), clear its timer DPs so the
+    // zone reads as off with 0 remaining, not a stale countdown value. Run the
+    // clear for every zone using the resolved per-zone DP ids (don't assume
+    // 106/107/109).
+    if (targetZoneDps) {
+      for (const zc of targetZoneDps) {
+        if (String(merged[String(zc.workStatus)]) === '0') {
+          delete merged[String(zc.manualTimer)];
+          delete merged[String(zc.remainTime)];
+        }
+      }
+    } else {
+      // Fallback for devices without a resolved schema: use the legacy
+      // hardcoded 106/153 zone-1/zone-2 ranges.
+      if (String(merged['106']) === '0') {
+        delete merged['107']; delete merged['109'];
+      }
+      if (String(merged['153']) === '0') {
+        delete merged['154']; delete merged['156'];
+      }
     }
     this.mqttDpAccumulator.set(targetDeviceId, merged);
     const parsedDps = merged;
 
     const zones: NormalizedZoneStatus[] = [];
 
-    // Map known zone DPs from the accumulated values. The zone-specific DPs
-    // (WorkStatus=106/153, ManualTimer=107/154, ManualSwitch=108/155,
-    // RemainTime=109/156) are the RainPoint TY irrigation schema. Zone 1 uses
-    // the base 106-109 range; zone 2 uses 153-156 (+47 offset).
-    //
-    // Live capture showed DP 107 is the DECREMENTING remaining-minutes timer
-    // (20->19->18...), while 109 (RemainTime) updates less frequently. Use
-    // 107 as the primary remaining-duration source, 109 as fallback.
-    const zoneConfigs = [
-      { port: 1, runDp: 106, timerDp: 107, remainDp: 109 },
-      { port: 2, runDp: 153, timerDp: 154, remainDp: 156 },
-    ];
+    // Map known zone DPs from the accumulated values. When the device has a
+    // resolved per-zone DP schema (zoneDps), use it — it's authoritative for
+    // any product (1-zone, 2-zone, arbitrary offsets). Fall back to the legacy
+    // hardcoded 106/153 ranges only when the schema is unavailable.
+    let zoneConfigs: Array<{ port: number; runDp: number; timerDp: number; remainDp: number }>;
+    if (targetZoneDps && targetZoneDps.length > 0) {
+      zoneConfigs = targetZoneDps.map((zc, i) => ({
+        port: i + 1,
+        runDp: zc.workStatus,
+        timerDp: zc.manualTimer,
+        remainDp: zc.remainTime,
+      }));
+    } else {
+      zoneConfigs = [
+        { port: 1, runDp: 106, timerDp: 107, remainDp: 109 },
+        { port: 2, runDp: 153, timerDp: 154, remainDp: 156 },
+      ];
+    }
 
     for (const zc of zoneConfigs) {
       const rawRun = parsedDps[String(zc.runDp)];
@@ -318,7 +345,21 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
       if (rawRun === undefined && rawTimer === undefined && rawRemain === undefined) {
         continue;
       }
-      const isOn = String(rawRun ?? '') === '1';
+      // isOn: WorkStatus "1" = running. When WorkStatus hasn't arrived yet but
+      // a positive ManualTimer has (the device often pushes the timer first
+      // when starting a manual run), treat the zone as ON so HomeKit reflects
+      // the running state without waiting for the run flag to arrive. Once
+      // WorkStatus arrives it confirms the state either way.
+      let isOn: boolean;
+      if (rawRun !== undefined) {
+        isOn = String(rawRun) === '1';
+      } else {
+        const timerMin = Number(rawTimer);
+        isOn = Number.isFinite(timerMin) && timerMin > 0;
+      }
+      // ManualTimer is the decrementing remaining-minutes counter; RemainTime
+      // is a secondary read-only timer that updates less frequently. Prefer
+      // ManualTimer, fall back to RemainTime.
       const remainingMin = Number(rawTimer ?? rawRemain ?? 0);
       zones.push({
         port: zc.port,
