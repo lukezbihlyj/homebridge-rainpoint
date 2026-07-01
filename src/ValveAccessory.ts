@@ -113,72 +113,60 @@ export class ValveAccessory {
 
   async setActive(value: CharacteristicValue): Promise<void> {
     const targetActive = value as number;
+    const Characteristic = this.platform.Characteristic;
+    const turnOn = targetActive === Characteristic.Active.ACTIVE;
     this.platform.log.info(
       '[%s] Setting valve to %s',
       this.context.portName,
-      targetActive === this.platform.Characteristic.Active.ACTIVE ? 'ON' : 'OFF',
+      turnOn ? 'ON' : 'OFF',
+    );
+
+    // Apply the optimistic state BEFORE the awaited API call. The Home app
+    // issues a GET InUse/Active immediately after the SET returns, and if that
+    // GET reads the (stale) status map it caches "Off" for ~10-15s. Updating
+    // the status map + characteristics first means the GET sees the commanded
+    // state. The MQTT accumulator is also seeded so real-time pushes merge
+    // onto the intended state instead of reverting it.
+    this.isOn = turnOn;
+    this.remainingDuration = turnOn ? this.setDuration : 0;
+    this.platform.applyOptimisticZoneState(
+      this.context.deviceId, this.context.port, turnOn, this.remainingDuration,
+    );
+    this.service.updateCharacteristic(
+      Characteristic.Active, turnOn ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE,
+    );
+    this.service.updateCharacteristic(
+      Characteristic.InUse, turnOn ? Characteristic.InUse.IN_USE : Characteristic.InUse.NOT_IN_USE,
+    );
+    this.service.updateCharacteristic(
+      Characteristic.RemainingDuration, this.remainingDuration,
     );
 
     try {
-      if (targetActive === this.platform.Characteristic.Active.ACTIVE) {
+      if (turnOn) {
         await this.platform.client.turnZoneOn(
-          this.context.deviceId,
-          this.context.port,
-          this.setDuration,
-        );
-        this.isOn = true;
-        this.remainingDuration = this.setDuration;
-
-        // Seed the platform's MQTT accumulator + status map so real-time MQTT
-        // pushes merge onto the commanded state instead of reverting to a
-        // stale "0" run flag from the previous stop during the gap between
-        // the command and the first MQTT confirmation push.
-        this.platform.applyOptimisticZoneState(
-          this.context.deviceId, this.context.port, true, this.setDuration,
-        );
-
-        // Optimistic update: immediately reflect ON + remaining duration so
-        // the Home app doesn't show stale state / "Waiting" before the next
-        // poll/MQTT push confirms the change.
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.Active,
-          this.platform.Characteristic.Active.ACTIVE,
-        );
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.InUse,
-          this.platform.Characteristic.InUse.IN_USE,
-        );
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.RemainingDuration,
-          this.remainingDuration,
+          this.context.deviceId, this.context.port, this.setDuration,
         );
       } else {
         await this.platform.client.turnZoneOff(
-          this.context.deviceId,
-          this.context.port,
-        );
-        this.isOn = false;
-        this.remainingDuration = 0;
-
-        this.platform.applyOptimisticZoneState(
-          this.context.deviceId, this.context.port, false, 0,
-        );
-
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.Active,
-          this.platform.Characteristic.Active.INACTIVE,
-        );
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.InUse,
-          this.platform.Characteristic.InUse.NOT_IN_USE,
-        );
-        this.service.updateCharacteristic(
-          this.platform.Characteristic.RemainingDuration,
-          0,
+          this.context.deviceId, this.context.port,
         );
       }
     } catch (error) {
+      // Revert the optimistic state on failure.
       this.platform.log.error('Failed to set valve: %s', error);
+      this.isOn = !turnOn;
+      this.remainingDuration = 0;
+      this.platform.applyOptimisticZoneState(
+        this.context.deviceId, this.context.port, !turnOn, 0,
+      );
+      this.service.updateCharacteristic(
+        Characteristic.Active, turnOn ? Characteristic.Active.INACTIVE : Characteristic.Active.ACTIVE,
+      );
+      this.service.updateCharacteristic(
+        Characteristic.InUse, turnOn ? Characteristic.InUse.NOT_IN_USE : Characteristic.InUse.IN_USE,
+      );
+      this.service.updateCharacteristic(Characteristic.RemainingDuration, 0);
       throw error;
     }
   }

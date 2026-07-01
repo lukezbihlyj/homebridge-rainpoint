@@ -192,37 +192,49 @@ export class IrrigationSystemAccessory {
       targetActive === 1 ? 'ON' : 'OFF',
     );
 
+    const valveService = this.accessory.services.find(
+      s => s.subtype === `zone${port}` && s.UUID === this.platform.Service.Valve.UUID,
+    );
+    const Characteristic = this.platform.Characteristic;
+    const turnOn = targetActive === Characteristic.Active.ACTIVE;
+    const duration = this.valveSetDurations.get(port) ?? DEFAULT_DURATION_SEC;
+
+    // Apply the optimistic state BEFORE the awaited API call. The Home app
+    // issues a GET InUse/Active immediately after the SET returns, and if that
+    // GET reads the (stale) status map it caches "Off" for ~10-15s. Updating
+    // the status map + characteristics first means the GET sees the commanded
+    // state. The MQTT accumulator is also seeded so real-time pushes merge
+    // onto the intended state instead of reverting it.
+    this.platform.applyOptimisticZoneState(
+      this.context.deviceId, port, turnOn, turnOn ? duration : 0,
+    );
+    valveService?.updateCharacteristic(
+      Characteristic.Active, turnOn ? Characteristic.Active.ACTIVE : Characteristic.Active.INACTIVE,
+    );
+    valveService?.updateCharacteristic(
+      Characteristic.InUse, turnOn ? Characteristic.InUse.IN_USE : Characteristic.InUse.NOT_IN_USE,
+    );
+    valveService?.updateCharacteristic(
+      Characteristic.RemainingDuration, turnOn ? duration : 0,
+    );
+
     try {
-      const valveService = this.accessory.services.find(
-        s => s.subtype === `zone${port}` && s.UUID === this.platform.Service.Valve.UUID,
-      );
-      const Characteristic = this.platform.Characteristic;
-
-      if (targetActive === this.platform.Characteristic.Active.ACTIVE) {
-        const duration = this.valveSetDurations.get(port) ?? DEFAULT_DURATION_SEC;
+      if (turnOn) {
         await this.platform.client.turnZoneOn(this.context.deviceId, port, duration);
-
-        // Seed the platform's MQTT accumulator + status map so real-time MQTT
-        // pushes merge onto the commanded state instead of reverting to a
-        // stale "0" run flag from the previous stop.
-        this.platform.applyOptimisticZoneState(this.context.deviceId, port, true, duration);
-
-        // Optimistic update: immediately reflect ON + remaining duration so the
-        // Home app doesn't show a stale state / "Waiting" before MQTT confirms.
-        valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.ACTIVE);
-        valveService?.updateCharacteristic(Characteristic.InUse, Characteristic.InUse.IN_USE);
-        valveService?.updateCharacteristic(Characteristic.RemainingDuration, duration);
       } else {
         await this.platform.client.turnZoneOff(this.context.deviceId, port);
-
-        this.platform.applyOptimisticZoneState(this.context.deviceId, port, false, 0);
-
-        valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.INACTIVE);
-        valveService?.updateCharacteristic(Characteristic.InUse, Characteristic.InUse.NOT_IN_USE);
-        valveService?.updateCharacteristic(Characteristic.RemainingDuration, 0);
       }
     } catch (error) {
+      // Revert the optimistic state on failure.
       this.platform.log.error('Failed to control valve: %s', error);
+      this.platform.applyOptimisticZoneState(this.context.deviceId, port, !turnOn, 0);
+      valveService?.updateCharacteristic(
+        Characteristic.Active, turnOn ? Characteristic.Active.INACTIVE : Characteristic.Active.ACTIVE,
+      );
+      valveService?.updateCharacteristic(
+        Characteristic.InUse, turnOn ? Characteristic.InUse.NOT_IN_USE : Characteristic.InUse.IN_USE,
+      );
+      valveService?.updateCharacteristic(Characteristic.RemainingDuration, 0);
       throw error;
     }
   }
