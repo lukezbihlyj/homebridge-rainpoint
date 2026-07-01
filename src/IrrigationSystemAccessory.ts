@@ -202,6 +202,11 @@ export class IrrigationSystemAccessory {
         const duration = this.valveSetDurations.get(port) ?? DEFAULT_DURATION_SEC;
         await this.platform.client.turnZoneOn(this.context.deviceId, port, duration);
 
+        // Seed the platform's MQTT accumulator + status map so real-time MQTT
+        // pushes merge onto the commanded state instead of reverting to a
+        // stale "0" run flag from the previous stop.
+        this.platform.applyOptimisticZoneState(this.context.deviceId, port, true, duration);
+
         // Optimistic update: immediately reflect ON + remaining duration so the
         // Home app doesn't show a stale state / "Waiting" before MQTT confirms.
         valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.ACTIVE);
@@ -209,6 +214,8 @@ export class IrrigationSystemAccessory {
         valveService?.updateCharacteristic(Characteristic.RemainingDuration, duration);
       } else {
         await this.platform.client.turnZoneOff(this.context.deviceId, port);
+
+        this.platform.applyOptimisticZoneState(this.context.deviceId, port, false, 0);
 
         valveService?.updateCharacteristic(Characteristic.Active, Characteristic.Active.INACTIVE);
         valveService?.updateCharacteristic(Characteristic.InUse, Characteristic.InUse.NOT_IN_USE);

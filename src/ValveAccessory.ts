@@ -129,6 +129,14 @@ export class ValveAccessory {
         this.isOn = true;
         this.remainingDuration = this.setDuration;
 
+        // Seed the platform's MQTT accumulator + status map so real-time MQTT
+        // pushes merge onto the commanded state instead of reverting to a
+        // stale "0" run flag from the previous stop during the gap between
+        // the command and the first MQTT confirmation push.
+        this.platform.applyOptimisticZoneState(
+          this.context.deviceId, this.context.port, true, this.setDuration,
+        );
+
         // Optimistic update: immediately reflect ON + remaining duration so
         // the Home app doesn't show stale state / "Waiting" before the next
         // poll/MQTT push confirms the change.
@@ -151,6 +159,10 @@ export class ValveAccessory {
         );
         this.isOn = false;
         this.remainingDuration = 0;
+
+        this.platform.applyOptimisticZoneState(
+          this.context.deviceId, this.context.port, false, 0,
+        );
 
         this.service.updateCharacteristic(
           this.platform.Characteristic.Active,

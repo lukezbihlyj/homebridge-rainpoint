@@ -289,27 +289,31 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
     // accumulator so zone state is derived from the full current set, not a
     // single-DP snapshot (which would zero the run flag and flicker OFF).
     const merged = this.mqttDpAccumulator.get(targetDeviceId) ?? {};
+    const incomingKeys = new Set<string>();
     for (const [k, v] of dps) {
       merged[k] = v;
+      incomingKeys.add(k);
     }
-    // When a zone's WorkStatus reads "0" (stopped), clear its timer DPs so the
-    // zone reads as off with 0 remaining, not a stale countdown value. Run the
-    // clear for every zone using the resolved per-zone DP ids (don't assume
-    // 106/107/109).
+    // When a zone's WorkStatus DP is pushed as "0" (stopped), clear its timer
+    // DPs so the zone reads as off with 0 remaining, not a stale countdown
+    // value. IMPORTANT: only clear when the run DP itself is in THIS push —
+    // the accumulator may hold a stale "0" from a previous stop, and clearing
+    // on that stale value would wipe a fresh ManualTimer push that arrived
+    // ahead of the run flag (the device pushes the timer before WorkStatus on
+    // start), leaving the zone stuck OFF until the run flag catches up.
     if (targetZoneDps) {
       for (const zc of targetZoneDps) {
-        if (String(merged[String(zc.workStatus)]) === '0') {
+        const runKey = String(zc.workStatus);
+        if (incomingKeys.has(runKey) && String(merged[runKey]) === '0') {
           delete merged[String(zc.manualTimer)];
           delete merged[String(zc.remainTime)];
         }
       }
     } else {
-      // Fallback for devices without a resolved schema: use the legacy
-      // hardcoded 106/153 zone-1/zone-2 ranges.
-      if (String(merged['106']) === '0') {
+      if (incomingKeys.has('106') && String(merged['106']) === '0') {
         delete merged['107']; delete merged['109'];
       }
-      if (String(merged['153']) === '0') {
+      if (incomingKeys.has('153') && String(merged['153']) === '0') {
         delete merged['154']; delete merged['156'];
       }
     }
@@ -338,24 +342,33 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
     }
 
     for (const zc of zoneConfigs) {
-      const rawRun = parsedDps[String(zc.runDp)];
-      const rawTimer = parsedDps[String(zc.timerDp)];
-      const rawRemain = parsedDps[String(zc.remainDp)];
+      const runKey = String(zc.runDp);
+      const timerKey = String(zc.timerDp);
+      const remainKey = String(zc.remainDp);
+      const rawRun = parsedDps[runKey];
+      const rawTimer = parsedDps[timerKey];
+      const rawRemain = parsedDps[remainKey];
       // Only emit a zone if we've seen its run OR timer DP at least once.
       if (rawRun === undefined && rawTimer === undefined && rawRemain === undefined) {
         continue;
       }
-      // isOn: WorkStatus "1" = running. When WorkStatus hasn't arrived yet but
-      // a positive ManualTimer has (the device often pushes the timer first
-      // when starting a manual run), treat the zone as ON so HomeKit reflects
-      // the running state without waiting for the run flag to arrive. Once
-      // WorkStatus arrives it confirms the state either way.
+      // isOn derivation is INCOMING-AWARE so out-of-order pushes don't flicker:
+      //  - The run-status DP (WorkStatus) is authoritative when present in this
+      //    push: "1" = running, "0" = stopped.
+      //  - The device often pushes ManualTimer (countdown minutes) BEFORE
+      //    WorkStatus on start. When the timer DP is in this push with a
+      //    positive value but the run flag hasn't been pushed yet (or is a
+      //    stale "0" from the previous stop still sitting in the accumulator),
+      //    treat the zone as ON — the positive timer is a reliable start
+      //    signal and the run flag will confirm shortly.
+      //  - Otherwise fall back to the accumulated run flag.
       let isOn: boolean;
-      if (rawRun !== undefined) {
+      if (incomingKeys.has(runKey)) {
         isOn = String(rawRun) === '1';
+      } else if (incomingKeys.has(timerKey) && Number(rawTimer) > 0) {
+        isOn = true;
       } else {
-        const timerMin = Number(rawTimer);
-        isOn = Number.isFinite(timerMin) && timerMin > 0;
+        isOn = String(rawRun ?? '') === '1';
       }
       // ManualTimer is the decrementing remaining-minutes counter; RemainTime
       // is a secondary read-only timer that updates less frequently. Prefer
@@ -605,6 +618,67 @@ export class RainPointPlatform implements DynamicPlatformPlugin {
 
   getDeviceStatus(deviceId: string): NormalizedDeviceStatus | undefined {
     return this.deviceStatusMap.get(deviceId);
+  }
+
+  /**
+   * Apply optimistic zone state immediately after a HomeKit-initiated
+   * turn-on/turn-off command. Seeds BOTH the MQTT DP accumulator (so the next
+   * real-time push merges onto the intended state instead of reverting to a
+   * stale "0" run flag from the previous stop) and the device status map (so
+   * any updateAccessories() triggered by another zone's push before the first
+   * MQTT confirmation doesn't revert the just-commanded zone's UI).
+   */
+  applyOptimisticZoneState(deviceId: string, port: number, isOn: boolean, durationSec: number): void {
+    if (this.provider !== 'ty') {
+      return;
+    }
+    // Seed the MQTT DP accumulator for this zone.
+    const device = this.normalizedDevices.get(deviceId);
+    const zoneDp = device?.zoneDps?.[port - 1];
+    if (zoneDp) {
+      const acc = this.mqttDpAccumulator.get(deviceId) ?? {};
+      if (isOn) {
+        acc[String(zoneDp.workStatus)] = '1';
+        const min = Math.max(1, Math.round(durationSec / 60));
+        acc[String(zoneDp.manualTimer)] = min;
+      } else {
+        acc[String(zoneDp.workStatus)] = '0';
+        delete acc[String(zoneDp.manualTimer)];
+        delete acc[String(zoneDp.remainTime)];
+      }
+      this.mqttDpAccumulator.set(deviceId, acc);
+    }
+    // Update the device status map so updateAccessories() between the command
+    // and the first MQTT push keeps the zone in the commanded state.
+    const status = this.deviceStatusMap.get(deviceId);
+    if (status) {
+      const zone = status.zones.find(z => z.port === port);
+      if (zone) {
+        zone.isOn = isOn;
+        zone.remainingDuration = isOn ? durationSec : 0;
+      } else {
+        status.zones.push({
+          port,
+          name: `Zone ${port}`,
+          isOn,
+          remainingDuration: isOn ? durationSec : 0,
+        });
+      }
+    } else {
+      this.deviceStatusMap.set(deviceId, {
+        deviceId,
+        online: true,
+        zones: [{
+          port,
+          name: `Zone ${port}`,
+          isOn,
+          remainingDuration: isOn ? durationSec : 0,
+        }],
+        moisture: null,
+        temperature: null,
+        battery: null,
+      });
+    }
   }
 
   private cleanupStaleAccessories(): void {
